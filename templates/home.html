@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+
+{% block title %}Главная{% endblock %}
+
+{% block content %}
+<h1>Учёт актов ремонта</h1>
+
+<p>Добро пожаловать в систему учёта актов ремонта оборудования.</p>
+
+<div class="nav">
+    <a href="{{ url_for('engineer_select') }}">Выбрать инженера</a>
+    <a href="{{ url_for('devices_search') }}">Поиск аппаратов</a>
+    <a href="{{ url_for('acts_list') }}">Список актов</a>
+</div>
+{% endblock %}

@@ -1,0 +1,173 @@
+{% extends 'base.html' %}
+
+{% block title %}{% if act %}Редактирование акта{% else %}Новый акт{% endif %}{% endblock %}
+
+{% block content %}
+<h1>{% if act %}Редактирование акта{% else %}Новый акт{% endif %}</h1>
+
+<div class="nav">
+    <a href="{{ url_for('index') }}">Главная</a>
+    <a href="{{ url_for('acts_list') }}">Список актов</a>
+</div>
+
+<form method="POST" action="{{ url_for('act_save') }}">
+    {% if act %}
+    <input type="hidden" name="act_id" value="{{ act.id }}">
+    {% endif %}
+
+    {% if device %}
+    <input type="hidden" name="source_device_id" value="{{ device.id }}">
+    {% endif %}
+
+    <h2>Информация об устройстве</h2>
+
+    <div class="form-group">
+        <label for="customer_name">Клиент *</label>
+        <input type="text" name="customer_name" id="customer_name" required 
+               value="{{ (act or device).customer_name if (act or device) else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="device_model">Модель устройства</label>
+        <input type="text" name="device_model" id="device_model" 
+               value="{{ (act or device).device_model if (act or device) else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="serial_number">Серийный номер</label>
+        <input type="text" name="serial_number" id="serial_number" 
+               value="{{ (act or device).serial_number if (act or device) else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="printeco_label">Маркировка Printeco</label>
+        <input type="text" name="printeco_label" id="printeco_label" 
+               value="{{ act.printeco_label if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="device_type">Тип устройства</label>
+        <input type="text" name="device_type" id="device_type" 
+               value="{{ act.device_type if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="address">Адрес</label>
+        <input type="text" name="address" id="address" 
+               value="{{ (act or device).address if (act or device) else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="phone">Телефон</label>
+        <input type="text" name="phone" id="phone" 
+               value="{{ act.phone if act else '' }}">
+    </div>
+
+    <h2>Диагностика и работы</h2>
+
+    <div class="form-group">
+        <label for="fault">Неисправность</label>
+        <textarea name="fault" id="fault">{{ act.fault if act else '' }}</textarea>
+    </div>
+
+    <div class="form-group">
+        <label for="counter_bw">Счётчик ч/б</label>
+        <input type="text" name="counter_bw" id="counter_bw" 
+               value="{{ act.counter_bw if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="counter_color">Счётчик цветной</label>
+        <input type="text" name="counter_color" id="counter_color" 
+               value="{{ act.counter_color if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="service_kind">Вид обслуживания</label>
+        <input type="text" name="service_kind" id="service_kind" 
+               value="{{ act.service_kind if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="diagnostics_result">Результат диагностики</label>
+        <textarea name="diagnostics_result" id="diagnostics_result">{{ act.diagnostics_result if act else '' }}</textarea>
+    </div>
+
+    <div class="form-group">
+        <label for="works_text">Выполненные работы</label>
+        <textarea name="works_text" id="works_text">{{ act.works_text if act else '' }}</textarea>
+    </div>
+
+    <div class="form-group">
+        <label for="materials_text">ЗИП (материалы)</label>
+        <textarea name="materials_text" id="materials_text" 
+                  placeholder="Наименование: Ролик; Артикул: ABC-001; Кол-во: 2">{{ act.materials_text if act else '' }}</textarea>
+    </div>
+
+    <h2>Дата и время</h2>
+
+    <div class="form-group">
+        <label for="work_date">Дата работы</label>
+        <input type="date" name="work_date" id="work_date" 
+               value="{{ act.work_date if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="start_time">Время начала</label>
+        <input type="time" name="start_time" id="start_time" 
+               value="{{ act.start_time if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="end_time">Время окончания</label>
+        <input type="time" name="end_time" id="end_time" 
+               value="{{ act.end_time if act else '' }}">
+    </div>
+
+    <h2>Дополнительно</h2>
+
+    <div class="form-group">
+        <label for="device_condition">Состояние устройства</label>
+        <input type="text" name="device_condition" id="device_condition" 
+               value="{{ act.device_condition if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="customer_representative">Представитель клиента</label>
+        <input type="text" name="customer_representative" id="customer_representative" 
+               value="{{ act.customer_representative if act else '' }}">
+    </div>
+
+    <div class="form-group">
+        <label for="customer_signatory">Подписант клиента</label>
+        <input type="text" name="customer_signatory" id="customer_signatory" 
+               value="{{ act.customer_signatory if act else '' }}">
+    </div>
+
+    {% if not act %}
+    <div class="form-group">
+        <label for="number_type">Тип акта</label>
+        <select name="number_type" id="number_type">
+            {% for key, type in number_types.items() %}
+            <option value="{{ key }}">{{ type.name }}</option>
+            {% endfor %}
+        </select>
+    </div>
+
+    <div class="form-group">
+        <label>
+            <input type="checkbox" name="is_draft" id="is_draft"> Сохранить как черновик
+        </label>
+    </div>
+    {% endif %}
+
+    <div style="margin-top: 30px;">
+        <button type="submit" class="btn btn-success">Сохранить</button>
+        {% if act %}
+        <a href="{{ url_for('act_view', act_id=act.id) }}" class="btn btn-secondary">Отмена</a>
+        {% else %}
+        <a href="{{ url_for('acts_list') }}" class="btn btn-secondary">Отмена</a>
+        {% endif %}
+    </div>
+</form>
+{% endblock %}

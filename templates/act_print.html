@@ -1,0 +1,154 @@
+{% extends 'base.html' %}
+
+{% block title %}Акт №{{ act.act_number or act.id }}{% endblock %}
+
+{% block content %}
+<h1>Акт №{{ act.act_number or act.id }}</h1>
+
+<div class="nav">
+    <a href="{{ url_for('index') }}">Главная</a>
+    <a href="{{ url_for('acts_list') }}">Список актов</a>
+    <a href="{{ url_for('act_edit', act_id=act.id) }}" class="btn btn-secondary">Редактировать</a>
+</div>
+
+<table style="margin: 20px 0;">
+    <tr>
+        <th style="width: 200px;">Номер акта</th>
+        <td>{{ act.act_number or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Статус</th>
+        <td>{{ 'Черновик' if act.status == 'draft' else 'Завершен' }}</td>
+    </tr>
+    <tr>
+        <th>Инженер</th>
+        <td>{{ act.engineer_name }}</td>
+    </tr>
+    <tr>
+        <th>Дата создания</th>
+        <td>{{ act.created_at[:16].replace('T', ' ') }}</td>
+    </tr>
+    <tr>
+        <th>Дата работы</th>
+        <td>{{ act.work_date or '—' }}</td>
+    </tr>
+</table>
+
+<h2>Устройство</h2>
+
+<table style="margin: 20px 0;">
+    <tr>
+        <th style="width: 200px;">Клиент</th>
+        <td>{{ act.customer_name or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Модель</th>
+        <td>{{ act.device_model or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Серийный номер</th>
+        <td>{{ act.serial_number or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Маркировка Printeco</th>
+        <td>{{ act.printeco_label or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Тип устройства</th>
+        <td>{{ act.device_type or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Адрес</th>
+        <td>{{ act.address or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Телефон</th>
+        <td>{{ act.phone or '—' }}</td>
+    </tr>
+</table>
+
+<h2>Диагностика и работы</h2>
+
+<table style="margin: 20px 0;">
+    <tr>
+        <th style="width: 200px;">Неисправность</th>
+        <td>{{ act.fault or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Счётчик ч/б</th>
+        <td>{{ act.counter_bw or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Счётчик цветной</th>
+        <td>{{ act.counter_color or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Вид обслуживания</th>
+        <td>{{ act.service_kind or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Результат диагностики</th>
+        <td>{{ act.diagnostics_result or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Выполненные работы</th>
+        <td>{{ act.works_text or '—' }}</td>
+    </tr>
+</table>
+
+<h2>ЗИП (материалы)</h2>
+
+{% if materials %}
+<table style="margin: 20px 0;">
+    <thead>
+        <tr>
+            <th>Наименование</th>
+            <th>Артикул</th>
+            <th>Кол-во</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for item in materials %}
+        <tr>
+            <td>{{ item.name or '—' }}</td>
+            <td>{{ item.article or '—' }}</td>
+            <td>{{ item.quantity or '—' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="muted">Материалы не указаны.</p>
+{% endif %}
+
+<h2>Дополнительно</h2>
+
+<table style="margin: 20px 0;">
+    <tr>
+        <th style="width: 200px;">Время начала</th>
+        <td>{{ act.start_time or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Время окончания</th>
+        <td>{{ act.end_time or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Состояние устройства</th>
+        <td>{{ act.device_condition or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Представитель клиента</th>
+        <td>{{ act.customer_representative or '—' }}</td>
+    </tr>
+    <tr>
+        <th>Подписант клиента</th>
+        <td>{{ act.customer_signatory or '—' }}</td>
+    </tr>
+</table>
+
+<div style="margin-top: 30px;">
+    <form method="POST" action="{{ url_for('act_delete', act_id=act.id) }}" style="display: inline;">
+        <button type="submit" class="btn btn-danger" onclick="return confirm('Удалить этот акт?')">Удалить акт</button>
+    </form>
+</div>
+{% endblock %}

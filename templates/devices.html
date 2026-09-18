@@ -1,0 +1,117 @@
+{% extends 'base.html' %}
+
+{% block title %}Поиск аппаратов{% endblock %}
+
+{% block content %}
+<h1>Поиск аппаратов</h1>
+
+<div class="nav">
+    <a href="{{ url_for('index') }}">Главная</a>
+    <a href="{{ url_for('acts_list') }}">Список актов</a>
+</div>
+
+<form method="GET" action="{{ url_for('devices_search') }}" style="margin: 20px 0;">
+    <div class="form-group">
+        <label for="q">Поиск по серийному номеру или модели:</label>
+        <input type="text" name="q" id="q" value="{{ query }}" placeholder="Введите серийный номер или модель">
+    </div>
+    <button type="submit" class="btn">Найти</button>
+</form>
+
+{% if intraservice_results %}
+<h2>IntraService</h2>
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Название</th>
+            <th>Описание</th>
+            <th>Создано</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for task in intraservice_results %}
+        <tr>
+            <td>{{ task.id }}</td>
+            <td>{{ task.name }}</td>
+            <td>{{ task.description }}</td>
+            <td>{{ task.created }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% if manual_devices %}
+<h2>Локальные (ручные)</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Клиент</th>
+            <th>Модель</th>
+            <th>Серийный номер</th>
+            <th>Адрес</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for device in manual_devices %}
+        <tr>
+            <td>{{ device.customer_name }}</td>
+            <td>{{ device.model or '—' }}</td>
+            <td>{{ device.serial_number }}</td>
+            <td>{{ device.address or '—' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% if google_devices %}
+<h2>Из Google Sheets</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Клиент</th>
+            <th>Модель</th>
+            <th>Серийный номер</th>
+            <th>Адрес</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for device in google_devices %}
+        <tr>
+            <td>{{ device.customer_name }}</td>
+            <td>{{ device.model or '—' }}</td>
+            <td>{{ device.serial_number }}</td>
+            <td>{{ device.address or '—' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% if not query and not intraservice_results and not manual_devices and not google_devices %}
+<p class="muted">Введите поисковый запрос, чтобы найти аппараты.</p>
+{% endif %}
+
+<h2 style="margin-top: 30px;">Добавить аппарат вручную</h2>
+<form method="POST" action="{{ url_for('device_save') }}">
+    <div class="form-group">
+        <label for="serial_number">Серийный номер *</label>
+        <input type="text" name="serial_number" id="serial_number" required>
+    </div>
+    <div class="form-group">
+        <label for="customer_name">Клиент *</label>
+        <input type="text" name="customer_name" id="customer_name" required>
+    </div>
+    <div class="form-group">
+        <label for="device_model">Модель</label>
+        <input type="text" name="device_model" id="device_model">
+    </div>
+    <div class="form-group">
+        <label for="address">Адрес</label>
+        <input type="text" name="address" id="address">
+    </div>
+    <button type="submit" class="btn btn-success">Сохранить</button>
+</form>
+{% endblock %}
