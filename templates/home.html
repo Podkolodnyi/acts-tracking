@@ -3,13 +3,36 @@
 {% block title %}Главная{% endblock %}
 
 {% block content %}
-<h1>Учёт актов ремонта</h1>
+<div class="card">
+  <h1>Здравствуйте, {{ engineer.name }}</h1>
 
-<p>Добро пожаловать в систему учёта актов ремонта оборудования.</p>
+  <p class="muted">
+    Выберите действие. Номер нового акта будет создан в формате
+    {{ engineer.code }}-ММ-НННН.
+  </p>
 
-<div class="nav">
-    <a href="{{ url_for('engineer_select') }}">Выбрать инженера</a>
-    <a href="{{ url_for('devices_search') }}">Поиск аппаратов</a>
-    <a href="{{ url_for('acts_list') }}">Список актов</a>
+  <div class="actions">
+    <a class="btn btn-primary" href="{{ url_for('devices') }}">
+      Найти аппарат и создать акт
+    </a>
+
+    <a class="btn" href="{{ url_for('new_act_manual') }}">
+      Создать акт вручную
+    </a>
+
+    <a class="btn" href="{{ url_for('acts') }}">
+      Поиск сохраненных актов
+    </a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Автозаполнение</h2>
+
+  <p>
+    После выбора строки из справочника в акт будут перенесены только
+    <b>клиент</b>, <b>модель</b> и <b>серийный номер</b>.
+    Остальные поля инженер заполняет вручную.
+  </p>
 </div>
 {% endblock %}

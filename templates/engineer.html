@@ -3,22 +3,22 @@
 {% block title %}Выбор инженера{% endblock %}
 
 {% block content %}
-<h1>Выберите инженера</h1>
+<div class="card" style="max-width:620px;margin:50px auto">
+  <h1>Кто работает?</h1>
+  <p class="muted">
+    Выберите себя. Имя будет указано исполнителем во всех новых актах.
+  </p>
 
-<p>Выберите себя. Имя будет указано исполнителем во всех новых актах.</p>
-
-<form method="POST" action="{{ url_for('engineer_select') }}">
-    <div class="form-group">
-        <label for="engineer_key">Инженер:</label>
-        <select name="engineer_key" id="engineer_key" required>
-            <option value="">— Выберите из списка —</option>
-            <option value="podkolodny">Подколодный</option>
-            <option value="dzyuba">Дзюба</option>
-            <option value="izyurov">Изъюров</option>
-            <option value="ozerov">Озеров</option>
-        </select>
+  <form method="post">
+    <div class="grid two">
+      {% for key, item in engineers.items() %}
+      <button class="btn btn-primary"
+              name="engineer_key"
+              value="{{ key }}">
+        {{ item.name }} · № {{ item.code }}
+      </button>
+      {% endfor %}
     </div>
-
-    <button type="submit" class="btn btn-success">Продолжить</button>
-</form>
+  </form>
+</div>
 {% endblock %}

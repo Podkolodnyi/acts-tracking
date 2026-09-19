@@ -1,160 +1,50 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Учёт актов{% endblock %}</title>
-    <style>
-        * {
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            line-height: 1.6;
-            margin: 0;
-            padding: 20px;
-            background: #f5f5f5;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        h1, h2, h3 {
-            margin-top: 0;
-        }
-        .nav {
-            margin-bottom: 20px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid #eee;
-        }
-        .nav a {
-            margin-right: 15px;
-            text-decoration: none;
-            color: #007bff;
-        }
-        .nav a:hover {
-            text-decoration: underline;
-        }
-        .form-group {
-            margin-bottom: 15px;
-        }
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: 500;
-        }
-        .form-group input,
-        .form-group select,
-        .form-group textarea {
-            width: 100%;
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        .form-group textarea {
-            min-height: 100px;
-            resize: vertical;
-        }
-        .btn {
-            display: inline-block;
-            padding: 8px 16px;
-            background: #007bff;
-            color: white;
-            text-decoration: none;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .btn:hover {
-            background: #0056b3;
-        }
-        .btn-secondary {
-            background: #6c757d;
-        }
-        .btn-secondary:hover {
-            background: #545b62;
-        }
-        .btn-success {
-            background: #28a745;
-        }
-        .btn-success:hover {
-            background: #1e7e34;
-        }
-        .btn-danger {
-            background: #dc3545;
-        }
-        .btn-danger:hover {
-            background: #bd2130;
-        }
-        .alert {
-            padding: 12px 16px;
-            margin-bottom: 20px;
-            border-radius: 4px;
-        }
-        .alert-success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        .alert-warning {
-            background: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffeaa7;
-        }
-        .alert-danger {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 20px 0;
-        }
-        th, td {
-            padding: 10px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
-        }
-        th {
-            background: #f8f9fa;
-            font-weight: 600;
-        }
-        .filters {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-bottom: 20px;
-        }
-        .filters input,
-        .filters select {
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
-        .muted {
-            color: #6c757d;
-            font-size: 13px;
-        }
-    </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Акты ремонтов{% endblock %}</title>
+  <style>
+    :root { --blue:#173a63; --green:#218a4d; --gray:#f3f5f7; --line:#d8dee6; --text:#1d2939; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Arial, sans-serif; color:var(--text); background:var(--gray); }
+    header { background:var(--blue); color:white; padding:14px 24px; display:flex; align-items:center; justify-content:space-between; gap:18px; }
+    header a { color:white; text-decoration:none; margin-right:16px; }
+    .brand { font-weight:700; font-size:20px; white-space:nowrap; }
+    .user { font-size:14px; white-space:nowrap; }
+    main { max-width:1300px; margin:24px auto; padding:0 18px 40px; }
+    .card { background:white; border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:18px; box-shadow:0 1px 2px #0000000a; }
+    h1 { margin-top:0; font-size:25px; } h2 { margin-top:0; font-size:20px; }
+    .btn { display:inline-block; padding:10px 14px; border-radius:6px; border:1px solid #bcc8d6; background:#fff; color:#172b4d; text-decoration:none; cursor:pointer; font-size:14px; }
+    .btn-primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+    .btn-success { background:var(--green); color:#fff; border-color:var(--green); }
+    .btn-danger { background:#bd3540; color:#fff; border-color:#bd3540; }
+    .flash { padding:12px 14px; border-radius:6px; margin-bottom:12px; } .success { background:#dcf4e5; color:#155b31; } .danger { background:#ffe1e3; color:#8a1720; } .warning { background:#fff2cc; color:#735900; }
+    table { width:100%; border-collapse:collapse; background:#fff; } th, td { padding:10px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top; } th { background:#eef3f8; font-size:13px; } tr:hover td { background:#fbfdff; }
+    input, select, textarea { width:100%; padding:9px; border:1px solid #b9c5d2; border-radius:5px; background:#fff; font:inherit; } textarea { min-height:88px; resize:vertical; }
+    label { font-size:13px; font-weight:700; display:block; margin:0 0 5px; }
+    .grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:14px; } .grid.two { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+    .field { margin-bottom:0; } .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; } .muted { color:#667085; font-size:14px; } .badge { display:inline-block; border-radius:99px; padding:3px 8px; font-size:12px; } .draft { background:#fff1c2; } .completed { background:#d9f3e2; }
+    @media (max-width:800px) { header { align-items:flex-start; flex-direction:column; } .grid, .grid.two { grid-template-columns:1fr; } table { display:block; overflow-x:auto; } }
+  </style>
 </head>
 <body>
-    <div class="container">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-
-        {% block content %}{% endblock %}
-    </div>
+<header>
+  <div class="brand">ПРИНТЭКО-СЕЙЛС · Акты ремонтов</div>
+  {% if engineer %}
+  <nav>
+    <a href="{{ url_for('home') }}">Главная</a>
+    <a href="{{ url_for('devices') }}">Аппараты</a>
+    <a href="{{ url_for('acts') }}">Акты</a>
+  </nav>
+  <div class="user">Инженер: {{ engineer.name }} · <a href="{{ url_for('logout') }}">сменить</a></div>
+  {% endif %}
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
 </body>
 </html>
