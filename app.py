@@ -59,8 +59,9 @@ app.config["SECRET_KEY"] = os.environ.get(
     "FLASK_SECRET_KEY",
     "change-this-before-network-use",
 )
-# Enable CORS for React frontend
-CORS(app)
+# Enable CORS for React frontend (with credentials, so the session cookie works)
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173")
+CORS(app, supports_credentials=True, origins=[FRONTEND_ORIGIN])
 
 
 @contextmanager
