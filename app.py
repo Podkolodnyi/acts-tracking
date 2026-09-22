@@ -1275,6 +1275,12 @@ def api_engineers():
 
 @app.route("/api/devices", methods=["GET"])
 def api_devices():
+    if not get_engineer():
+        return jsonify({
+            "error": "Не выбран инженер",
+            "code": "UNAUTHENTICATED",
+        }), 401
+
     q = clean(request.args.get("q", ""))
 
     if not q:
@@ -1313,6 +1319,12 @@ def api_devices():
 
 @app.route("/api/acts", methods=["GET"])
 def api_acts_list():
+    if not get_engineer():
+        return jsonify({
+            "error": "Не выбран инженер",
+            "code": "UNAUTHENTICATED",
+        }), 401
+
     q = clean(request.args.get("q", ""))
     engineer_filter = clean(request.args.get("engineer", ""))
     status_filter = clean(request.args.get("status", ""))
@@ -1387,6 +1399,12 @@ def api_acts_list():
 
 @app.route("/api/acts/<int:act_id>", methods=["GET"])
 def api_act_detail(act_id):
+    if not get_engineer():
+        return jsonify({
+            "error": "Не выбран инженер",
+            "code": "UNAUTHENTICATED",
+        }), 401
+
     with db() as con:
         act = con.execute(
             "SELECT * FROM acts WHERE id = ?",
