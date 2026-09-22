@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from flask import (
     Flask,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -451,6 +452,48 @@ def choose_engineer():
 def logout():
     session.clear()
     return redirect(url_for("choose_engineer"))
+
+
+@app.route("/api/session", methods=["GET"])
+def api_session():
+    engineer = get_engineer()
+    if not engineer:
+        return jsonify({"engineer": None})
+
+    return jsonify({
+        "engineer": {
+            "id": session.get("engineer_key"),
+            "name": engineer["name"],
+            "code": engineer["code"],
+        }
+    })
+
+
+@app.route("/api/session/engineer", methods=["POST"])
+def api_session_engineer():
+    data = request.get_json(silent=True) or {}
+    key = data.get("engineer_key", "")
+
+    if key not in ENGINEERS:
+        return jsonify({
+            "error": "Неизвестный инженер",
+            "code": "INVALID_ENGINEER",
+        }), 400
+
+    session["engineer_key"] = key
+    return jsonify({
+        "engineer": {
+            "id": key,
+            "name": ENGINEERS[key]["name"],
+            "code": ENGINEERS[key]["code"],
+        }
+    })
+
+
+@app.route("/api/session", methods=["DELETE"])
+def api_session_logout():
+    session.clear()
+    return jsonify({"engineer": None})
 
 
 @app.route("/devices")
@@ -1216,8 +1259,6 @@ def export_filled_act(act_id):
             "spreadsheetml.sheet"
         ),
     )
-
-from flask import jsonify
 
 
 @app.route("/api/engineers", methods=["GET"])
