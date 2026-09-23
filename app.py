@@ -222,6 +222,13 @@ def init_db():
                 "ADD COLUMN number_type TEXT NOT NULL DEFAULT 'standard'"
             )
 
+        engineer_columns = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(engineers)").fetchall()
+        }
+        if "first_name" not in engineer_columns:
+            con.execute("ALTER TABLE engineers ADD COLUMN first_name TEXT")
+
         has_engineers = con.execute(
             "SELECT 1 FROM engineers LIMIT 1"
         ).fetchone()
@@ -264,7 +271,7 @@ def get_engineer():
 
     with db() as con:
         row = con.execute(
-            "SELECT name, code, is_admin FROM engineers "
+            "SELECT name, first_name, code, is_admin FROM engineers "
             "WHERE key = ? AND status = 'active'",
             (key,),
         ).fetchone()
@@ -274,6 +281,7 @@ def get_engineer():
 
     return {
         "name": row["name"],
+        "first_name": row["first_name"] or "",
         "code": row["code"],
         "is_admin": bool(row["is_admin"]),
     }
@@ -289,6 +297,55 @@ def require_engineer():
 def require_admin():
     engineer = get_engineer()
     return bool(engineer and engineer["is_admin"])
+
+
+CYRILLIC_TO_LATIN = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def transliterate(text):
+    return "".join(
+        CYRILLIC_TO_LATIN.get(ch, ch if ch.isalnum() else "")
+        for ch in text.lower()
+    )
+
+
+def generate_engineer_key(con, first_name, last_name):
+    def is_free(candidate):
+        return not con.execute(
+            "SELECT 1 FROM engineers WHERE key = ?", (candidate,)
+        ).fetchone()
+
+    base = transliterate(last_name)
+    if base and is_free(base):
+        return base
+
+    combined = f"{base}_{transliterate(first_name)}".strip("_")
+    if combined and is_free(combined):
+        return combined
+
+    fallback = combined or base or "engineer"
+    suffix = 2
+    while not is_free(f"{fallback}{suffix}"):
+        suffix += 1
+    return f"{fallback}{suffix}"
+
+
+def generate_engineer_code(con):
+    used_codes = {
+        int(row["code"])
+        for row in con.execute("SELECT code FROM engineers").fetchall()
+        if row["code"].isdigit()
+    }
+    candidate = 10
+    while candidate in used_codes:
+        candidate += 1
+    return str(candidate)
 
 
 def next_act_number(
@@ -534,6 +591,7 @@ def api_session():
         "engineer": {
             "id": session.get("engineer_key"),
             "name": engineer["name"],
+            "first_name": engineer["first_name"],
             "code": engineer["code"],
             "is_admin": engineer["is_admin"],
         }
@@ -550,7 +608,14 @@ def api_session_logout():
 def api_session_claim():
     data = request.get_json(silent=True) or {}
     key = data.get("engineer_key", "")
+    first_name = clean(data.get("first_name", ""))
     password = data.get("password", "")
+
+    if not first_name:
+        return jsonify({
+            "error": "Укажите имя",
+            "code": "MISSING_FIELDS",
+        }), 400
 
     if len(password) < 6:
         return jsonify({
@@ -578,8 +643,9 @@ def api_session_claim():
             }), 400
 
         con.execute(
-            "UPDATE engineers SET password_hash = ? WHERE key = ?",
-            (generate_password_hash(password), key),
+            "UPDATE engineers SET password_hash = ?, first_name = ? "
+            "WHERE key = ?",
+            (generate_password_hash(password), first_name, key),
         )
 
     session["engineer_key"] = key
@@ -587,6 +653,7 @@ def api_session_claim():
         "engineer": {
             "id": row["key"],
             "name": row["name"],
+            "first_name": first_name,
             "code": row["code"],
             "is_admin": bool(row["is_admin"]),
         }
@@ -601,8 +668,8 @@ def api_session_login():
 
     with db() as con:
         row = con.execute(
-            "SELECT key, name, code, password_hash, is_admin FROM engineers "
-            "WHERE key = ? AND status = 'active'",
+            "SELECT key, name, first_name, code, password_hash, is_admin "
+            "FROM engineers WHERE key = ? AND status = 'active'",
             (key,),
         ).fetchone()
 
@@ -623,6 +690,7 @@ def api_session_login():
         "engineer": {
             "id": row["key"],
             "name": row["name"],
+            "first_name": row["first_name"] or "",
             "code": row["code"],
             "is_admin": bool(row["is_admin"]),
         }
@@ -632,12 +700,11 @@ def api_session_login():
 @app.route("/api/session/register", methods=["POST"])
 def api_session_register():
     data = request.get_json(silent=True) or {}
-    key = clean(data.get("key", ""))
-    name = clean(data.get("name", ""))
-    code = clean(data.get("code", ""))
+    first_name = clean(data.get("first_name", ""))
+    last_name = clean(data.get("last_name", ""))
     password = data.get("password", "")
 
-    if not key or not name or not code:
+    if not first_name or not last_name:
         return jsonify({
             "error": "Заполните все поля",
             "code": "MISSING_FIELDS",
@@ -650,24 +717,35 @@ def api_session_register():
         }), 400
 
     with db() as con:
-        existing = con.execute(
-            "SELECT 1 FROM engineers WHERE key = ? OR code = ?",
-            (key, code),
+        duplicate = con.execute(
+            "SELECT 1 FROM engineers "
+            "WHERE lower(first_name) = lower(?) AND lower(name) = lower(?)",
+            (first_name, last_name),
         ).fetchone()
 
-        if existing:
+        if duplicate:
             return jsonify({
-                "error": "Такой логин или код уже заняты",
-                "code": "ALREADY_EXISTS",
+                "error": (
+                    f"Инженер «{first_name} {last_name}» уже "
+                    "зарегистрирован. Если это другой человек, "
+                    "добавьте цифру к фамилии, например "
+                    f"«{last_name} 2»."
+                ),
+                "code": "DUPLICATE_NAME",
             }), 400
+
+        key = generate_engineer_key(con, first_name, last_name)
+        code = generate_engineer_code(con)
 
         con.execute(
             "INSERT INTO engineers "
-            "(key, name, code, password_hash, is_admin, status, created_at) "
-            "VALUES (?, ?, ?, ?, 0, 'pending', ?)",
+            "(key, name, first_name, code, password_hash, is_admin, "
+            "status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, 'pending', ?)",
             (
                 key,
-                name,
+                last_name,
+                first_name,
                 code,
                 generate_password_hash(password),
                 datetime.now().isoformat(timespec="seconds"),
@@ -690,7 +768,7 @@ def api_admin_pending_engineers():
 
     with db() as con:
         rows = con.execute(
-            "SELECT key, name, code, created_at FROM engineers "
+            "SELECT key, name, first_name, code, created_at FROM engineers "
             "WHERE status = 'pending' ORDER BY created_at"
         ).fetchall()
 
@@ -698,6 +776,7 @@ def api_admin_pending_engineers():
         {
             "id": row["key"],
             "name": row["name"],
+            "first_name": row["first_name"] or "",
             "code": row["code"],
             "created_at": row["created_at"],
         }
@@ -750,6 +829,81 @@ def api_admin_reject_engineer(key):
             }), 404
 
     return jsonify({"status": "rejected"})
+
+
+@app.route("/api/admin/engineers", methods=["GET"])
+def api_admin_engineers():
+    if not require_admin():
+        return jsonify({
+            "error": "Недостаточно прав",
+            "code": "FORBIDDEN",
+        }), 403
+
+    with db() as con:
+        rows = con.execute(
+            "SELECT key, name, first_name, code, is_admin FROM engineers "
+            "WHERE status = 'active' ORDER BY name"
+        ).fetchall()
+
+    return jsonify([
+        {
+            "id": row["key"],
+            "name": row["name"],
+            "first_name": row["first_name"] or "",
+            "code": row["code"],
+            "is_admin": bool(row["is_admin"]),
+        }
+        for row in rows
+    ])
+
+
+@app.route("/api/admin/engineers/<key>", methods=["DELETE"])
+def api_admin_delete_engineer(key):
+    if not require_admin():
+        return jsonify({
+            "error": "Недостаточно прав",
+            "code": "FORBIDDEN",
+        }), 403
+
+    if key == session.get("engineer_key"):
+        return jsonify({
+            "error": "Нельзя удалить свою учётную запись",
+            "code": "CANNOT_DELETE_SELF",
+        }), 400
+
+    with db() as con:
+        row = con.execute(
+            "SELECT is_admin FROM engineers WHERE key = ? AND status = 'active'",
+            (key,),
+        ).fetchone()
+
+        if not row:
+            return jsonify({
+                "error": "Инженер не найден",
+                "code": "NOT_FOUND",
+            }), 404
+
+        if row["is_admin"]:
+            admin_count = con.execute(
+                "SELECT COUNT(*) AS n FROM engineers "
+                "WHERE is_admin = 1 AND status = 'active'"
+            ).fetchone()["n"]
+
+            if admin_count <= 1:
+                return jsonify({
+                    "error": "Нельзя удалить последнего администратора",
+                    "code": "LAST_ADMIN",
+                }), 400
+
+        # Soft delete: keep the row so its key/code can never be
+        # reassigned to someone else later (act numbering depends on
+        # a code staying tied to one person forever).
+        con.execute(
+            "UPDATE engineers SET status = 'deleted' WHERE key = ?",
+            (key,),
+        )
+
+    return jsonify({"status": "deleted"})
 
 
 @app.route("/devices")
@@ -1523,14 +1677,15 @@ def export_filled_act(act_id):
 def api_engineers():
     with db() as con:
         rows = con.execute(
-            "SELECT key, name, code, password_hash FROM engineers "
-            "WHERE status = 'active' ORDER BY name"
+            "SELECT key, name, first_name, code, password_hash "
+            "FROM engineers WHERE status = 'active' ORDER BY name"
         ).fetchall()
 
     return jsonify([
         {
             "id": row["key"],
             "name": row["name"],
+            "first_name": row["first_name"] or "",
             "code": row["code"],
             "has_password": row["password_hash"] is not None,
         }
