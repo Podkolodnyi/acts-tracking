@@ -906,6 +906,70 @@ def api_admin_delete_engineer(key):
     return jsonify({"status": "deleted"})
 
 
+@app.route("/api/admin/engineers/<key>/promote", methods=["POST"])
+def api_admin_promote_engineer(key):
+    if not require_admin():
+        return jsonify({
+            "error": "Недостаточно прав",
+            "code": "FORBIDDEN",
+        }), 403
+
+    with db() as con:
+        result = con.execute(
+            "UPDATE engineers SET is_admin = 1 "
+            "WHERE key = ? AND status = 'active'",
+            (key,),
+        )
+
+        if result.rowcount == 0:
+            return jsonify({
+                "error": "Инженер не найден",
+                "code": "NOT_FOUND",
+            }), 404
+
+    return jsonify({"is_admin": True})
+
+
+@app.route("/api/admin/engineers/<key>/demote", methods=["POST"])
+def api_admin_demote_engineer(key):
+    if not require_admin():
+        return jsonify({
+            "error": "Недостаточно прав",
+            "code": "FORBIDDEN",
+        }), 403
+
+    with db() as con:
+        row = con.execute(
+            "SELECT is_admin FROM engineers WHERE key = ? AND status = 'active'",
+            (key,),
+        ).fetchone()
+
+        if not row:
+            return jsonify({
+                "error": "Инженер не найден",
+                "code": "NOT_FOUND",
+            }), 404
+
+        if row["is_admin"]:
+            admin_count = con.execute(
+                "SELECT COUNT(*) AS n FROM engineers "
+                "WHERE is_admin = 1 AND status = 'active'"
+            ).fetchone()["n"]
+
+            if admin_count <= 1:
+                return jsonify({
+                    "error": "Нельзя снять права с последнего администратора",
+                    "code": "LAST_ADMIN",
+                }), 400
+
+        con.execute(
+            "UPDATE engineers SET is_admin = 0 WHERE key = ?",
+            (key,),
+        )
+
+    return jsonify({"is_admin": False})
+
+
 @app.route("/devices")
 def devices():
     if not require_engineer():
