@@ -26,6 +26,7 @@ from flask import (
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -43,11 +44,13 @@ SHEET_URL = (
     "export?format=csv&gid=467885286"
 )
 
-ENGINEERS = {
-    "podkolodny": {"name": "Подколодный", "code": "1"},
-    "dzyuba": {"name": "Дзюба", "code": "2"},
-    "izyurov": {"name": "Изъюров", "code": "5"},
-    "ozerov": {"name": "Озеров", "code": "9"},
+# One-time seed data for the `engineers` table (see init_db). Editing this
+# after the first run has no effect — it only backfills an empty table.
+SEED_ENGINEERS = {
+    "podkolodny": {"name": "Подколодный", "code": "1", "is_admin": True},
+    "dzyuba": {"name": "Дзюба", "code": "2", "is_admin": False},
+    "izyurov": {"name": "Изъюров", "code": "5", "is_admin": False},
+    "ozerov": {"name": "Озеров", "code": "9", "is_admin": False},
 }
 
 NUMBER_TYPES = {
@@ -196,6 +199,16 @@ def init_db():
                 ON acts(act_number);
             CREATE INDEX IF NOT EXISTS idx_acts_engineer
                 ON acts(engineer_key);
+
+            CREATE TABLE IF NOT EXISTS engineers (
+                key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                code TEXT NOT NULL UNIQUE,
+                password_hash TEXT,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -209,9 +222,61 @@ def init_db():
                 "ADD COLUMN number_type TEXT NOT NULL DEFAULT 'standard'"
             )
 
+        has_engineers = con.execute(
+            "SELECT 1 FROM engineers LIMIT 1"
+        ).fetchone()
+        if not has_engineers:
+            now = datetime.now().isoformat(timespec="seconds")
+            con.executemany(
+                "INSERT INTO engineers "
+                "(key, name, code, password_hash, is_admin, status, created_at) "
+                "VALUES (?, ?, ?, NULL, ?, 'active', ?)",
+                [
+                    (key, value["name"], value["code"], int(value["is_admin"]), now)
+                    for key, value in SEED_ENGINEERS.items()
+                ],
+            )
+
+
+def get_engineers_dict(con=None):
+    if con is None:
+        with db() as fresh_con:
+            return get_engineers_dict(fresh_con)
+
+    rows = con.execute(
+        "SELECT key, name, code, is_admin, status FROM engineers"
+    ).fetchall()
+    return {
+        row["key"]: {
+            "name": row["name"],
+            "code": row["code"],
+            "is_admin": bool(row["is_admin"]),
+            "status": row["status"],
+        }
+        for row in rows
+    }
+
 
 def get_engineer():
-    return ENGINEERS.get(session.get("engineer_key"))
+    key = session.get("engineer_key")
+    if not key:
+        return None
+
+    with db() as con:
+        row = con.execute(
+            "SELECT name, code, is_admin FROM engineers "
+            "WHERE key = ? AND status = 'active'",
+            (key,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "name": row["name"],
+        "code": row["code"],
+        "is_admin": bool(row["is_admin"]),
+    }
 
 
 def require_engineer():
@@ -219,6 +284,11 @@ def require_engineer():
         flash("Сначала выберите инженера.", "warning")
         return False
     return True
+
+
+def require_admin():
+    engineer = get_engineer()
+    return bool(engineer and engineer["is_admin"])
 
 
 def next_act_number(
@@ -440,12 +510,12 @@ def home():
 @app.route("/engineer", methods=["GET", "POST"])
 def choose_engineer():
     if request.method == "POST":
-        key = request.form.get("engineer_key", "")
-        if key in ENGINEERS:
-            session["engineer_key"] = key
-            return redirect(url_for("home"))
-        flash("Выберите инженера из списка.", "danger")
-    return render_template("engineer.html", engineers=ENGINEERS)
+        flash(
+            "Вход через эту страницу отключён. "
+            "Используйте веб-приложение.",
+            "danger",
+        )
+    return render_template("engineer.html", engineers=get_engineers_dict())
 
 
 @app.route("/logout")
@@ -465,27 +535,7 @@ def api_session():
             "id": session.get("engineer_key"),
             "name": engineer["name"],
             "code": engineer["code"],
-        }
-    })
-
-
-@app.route("/api/session/engineer", methods=["POST"])
-def api_session_engineer():
-    data = request.get_json(silent=True) or {}
-    key = data.get("engineer_key", "")
-
-    if key not in ENGINEERS:
-        return jsonify({
-            "error": "Неизвестный инженер",
-            "code": "INVALID_ENGINEER",
-        }), 400
-
-    session["engineer_key"] = key
-    return jsonify({
-        "engineer": {
-            "id": key,
-            "name": ENGINEERS[key]["name"],
-            "code": ENGINEERS[key]["code"],
+            "is_admin": engineer["is_admin"],
         }
     })
 
@@ -494,6 +544,212 @@ def api_session_engineer():
 def api_session_logout():
     session.clear()
     return jsonify({"engineer": None})
+
+
+@app.route("/api/session/claim", methods=["POST"])
+def api_session_claim():
+    data = request.get_json(silent=True) or {}
+    key = data.get("engineer_key", "")
+    password = data.get("password", "")
+
+    if len(password) < 6:
+        return jsonify({
+            "error": "Пароль должен быть не короче 6 символов",
+            "code": "WEAK_PASSWORD",
+        }), 400
+
+    with db() as con:
+        row = con.execute(
+            "SELECT key, name, code, password_hash, is_admin FROM engineers "
+            "WHERE key = ? AND status = 'active'",
+            (key,),
+        ).fetchone()
+
+        if not row:
+            return jsonify({
+                "error": "Инженер не найден",
+                "code": "NOT_FOUND",
+            }), 404
+
+        if row["password_hash"] is not None:
+            return jsonify({
+                "error": "Пароль уже задан, используйте вход",
+                "code": "ALREADY_CLAIMED",
+            }), 400
+
+        con.execute(
+            "UPDATE engineers SET password_hash = ? WHERE key = ?",
+            (generate_password_hash(password), key),
+        )
+
+    session["engineer_key"] = key
+    return jsonify({
+        "engineer": {
+            "id": row["key"],
+            "name": row["name"],
+            "code": row["code"],
+            "is_admin": bool(row["is_admin"]),
+        }
+    })
+
+
+@app.route("/api/session/login", methods=["POST"])
+def api_session_login():
+    data = request.get_json(silent=True) or {}
+    key = data.get("engineer_key", "")
+    password = data.get("password", "")
+
+    with db() as con:
+        row = con.execute(
+            "SELECT key, name, code, password_hash, is_admin FROM engineers "
+            "WHERE key = ? AND status = 'active'",
+            (key,),
+        ).fetchone()
+
+    if not row or not row["password_hash"]:
+        return jsonify({
+            "error": "Неверный логин или пароль",
+            "code": "INVALID_CREDENTIALS",
+        }), 401
+
+    if not check_password_hash(row["password_hash"], password):
+        return jsonify({
+            "error": "Неверный логин или пароль",
+            "code": "INVALID_CREDENTIALS",
+        }), 401
+
+    session["engineer_key"] = key
+    return jsonify({
+        "engineer": {
+            "id": row["key"],
+            "name": row["name"],
+            "code": row["code"],
+            "is_admin": bool(row["is_admin"]),
+        }
+    })
+
+
+@app.route("/api/session/register", methods=["POST"])
+def api_session_register():
+    data = request.get_json(silent=True) or {}
+    key = clean(data.get("key", ""))
+    name = clean(data.get("name", ""))
+    code = clean(data.get("code", ""))
+    password = data.get("password", "")
+
+    if not key or not name or not code:
+        return jsonify({
+            "error": "Заполните все поля",
+            "code": "MISSING_FIELDS",
+        }), 400
+
+    if len(password) < 6:
+        return jsonify({
+            "error": "Пароль должен быть не короче 6 символов",
+            "code": "WEAK_PASSWORD",
+        }), 400
+
+    with db() as con:
+        existing = con.execute(
+            "SELECT 1 FROM engineers WHERE key = ? OR code = ?",
+            (key, code),
+        ).fetchone()
+
+        if existing:
+            return jsonify({
+                "error": "Такой логин или код уже заняты",
+                "code": "ALREADY_EXISTS",
+            }), 400
+
+        con.execute(
+            "INSERT INTO engineers "
+            "(key, name, code, password_hash, is_admin, status, created_at) "
+            "VALUES (?, ?, ?, ?, 0, 'pending', ?)",
+            (
+                key,
+                name,
+                code,
+                generate_password_hash(password),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+
+    return jsonify({
+        "status": "pending",
+        "message": "Заявка отправлена. Дождитесь подтверждения администратором.",
+    })
+
+
+@app.route("/api/admin/pending-engineers", methods=["GET"])
+def api_admin_pending_engineers():
+    if not require_admin():
+        return jsonify({
+            "error": "Недостаточно прав",
+            "code": "FORBIDDEN",
+        }), 403
+
+    with db() as con:
+        rows = con.execute(
+            "SELECT key, name, code, created_at FROM engineers "
+            "WHERE status = 'pending' ORDER BY created_at"
+        ).fetchall()
+
+    return jsonify([
+        {
+            "id": row["key"],
+            "name": row["name"],
+            "code": row["code"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ])
+
+
+@app.route("/api/admin/engineers/<key>/approve", methods=["POST"])
+def api_admin_approve_engineer(key):
+    if not require_admin():
+        return jsonify({
+            "error": "Недостаточно прав",
+            "code": "FORBIDDEN",
+        }), 403
+
+    with db() as con:
+        result = con.execute(
+            "UPDATE engineers SET status = 'active' "
+            "WHERE key = ? AND status = 'pending'",
+            (key,),
+        )
+
+        if result.rowcount == 0:
+            return jsonify({
+                "error": "Заявка не найдена",
+                "code": "NOT_FOUND",
+            }), 404
+
+    return jsonify({"status": "active"})
+
+
+@app.route("/api/admin/engineers/<key>/reject", methods=["POST"])
+def api_admin_reject_engineer(key):
+    if not require_admin():
+        return jsonify({
+            "error": "Недостаточно прав",
+            "code": "FORBIDDEN",
+        }), 403
+
+    with db() as con:
+        result = con.execute(
+            "DELETE FROM engineers WHERE key = ? AND status = 'pending'",
+            (key,),
+        )
+
+        if result.rowcount == 0:
+            return jsonify({
+                "error": "Заявка не найдена",
+                "code": "NOT_FOUND",
+            }), 404
+
+    return jsonify({"status": "rejected"})
 
 
 @app.route("/devices")
@@ -629,7 +885,7 @@ def save_act():
         return redirect(url_for("choose_engineer"))
 
     engineer_key = session["engineer_key"]
-    engineer = ENGINEERS[engineer_key]
+    engineer = get_engineer()
     now = datetime.now()
     act_id = request.form.get("act_id")
     status = request.form.get("status", "draft")
@@ -800,10 +1056,12 @@ def acts():
     if date_sort not in {"newest", "oldest"}:
         date_sort = "newest"
 
+    engineers_dict = get_engineers_dict()
+
     sql = "SELECT * FROM acts WHERE 1=1"
     params = []
 
-    if engineer_filter in ENGINEERS:
+    if engineer_filter in engineers_dict:
         sql += " AND engineer_key = ?"
         params.append(engineer_filter)
     if status_filter in {"draft", "completed"}:
@@ -841,7 +1099,7 @@ def acts():
         "acts.html",
         acts=rows,
         q=q,
-        engineers=ENGINEERS,
+        engineers=engineers_dict,
         engineer_filter=engineer_filter,
         status_filter=status_filter,
         date_sort=date_sort,
@@ -878,7 +1136,7 @@ def export_acts():
     """
     params = []
 
-    if engineer_filter in ENGINEERS:
+    if engineer_filter in get_engineers_dict():
         sql += " AND engineer_key = ?"
         params.append(engineer_filter)
     if status_filter in {"draft", "completed"}:
@@ -985,7 +1243,7 @@ def export_short_acts():
     sql = "SELECT * FROM acts WHERE 1=1"
     params = []
 
-    if engineer_filter in ENGINEERS:
+    if engineer_filter in get_engineers_dict():
         sql += " AND engineer_key = ?"
         params.append(engineer_filter)
 
@@ -1263,13 +1521,20 @@ def export_filled_act(act_id):
 
 @app.route("/api/engineers", methods=["GET"])
 def api_engineers():
+    with db() as con:
+        rows = con.execute(
+            "SELECT key, name, code, password_hash FROM engineers "
+            "WHERE status = 'active' ORDER BY name"
+        ).fetchall()
+
     return jsonify([
         {
-            "id": key,
-            "name": value["name"],
-            "code": value["code"],
+            "id": row["key"],
+            "name": row["name"],
+            "code": row["code"],
+            "has_password": row["password_hash"] is not None,
         }
-        for key, value in ENGINEERS.items()
+        for row in rows
     ])
 
 
@@ -1359,7 +1624,7 @@ def api_acts_list():
         """
         params.extend([f"%{q}%"] * 4)
 
-    if engineer_filter in ENGINEERS:
+    if engineer_filter in get_engineers_dict():
         sql += " AND engineer_key = ?"
         params.append(engineer_filter)
 
