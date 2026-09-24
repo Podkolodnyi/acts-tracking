@@ -1832,17 +1832,6 @@ def api_acts_list():
     """
     params = []
 
-    if q:
-        sql += """
-            AND (
-                act_number LIKE ?
-                OR serial_number LIKE ?
-                OR customer_name LIKE ?
-                OR device_model LIKE ?
-            )
-        """
-        params.extend([f"%{q}%"] * 4)
-
     if engineer_filter in get_engineers_dict():
         sql += " AND engineer_key = ?"
         params.append(engineer_filter)
@@ -1859,10 +1848,27 @@ def api_acts_list():
         sql += " AND DATE(created_at) <= DATE(?)"
         params.append(date_to)
 
-    sql += " ORDER BY datetime(created_at) DESC, id DESC LIMIT 200"
+    sql += " ORDER BY datetime(created_at) DESC, id DESC"
 
     with db() as con:
         rows = con.execute(sql, params).fetchall()
+
+    if q:
+        # SQLite's LIKE is only case-insensitive for ASCII, so Cyrillic
+        # searches ("дикси" vs "ДИКСИ") need Python-side filtering.
+        q_norm = q.lower()
+        rows = [
+            row
+            for row in rows
+            if (
+                q_norm in (row["act_number"] or "").lower()
+                or q_norm in (row["serial_number"] or "").lower()
+                or q_norm in (row["customer_name"] or "").lower()
+                or q_norm in (row["device_model"] or "").lower()
+            )
+        ]
+
+    rows = rows[:200]
 
     return jsonify([
         {
