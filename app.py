@@ -53,6 +53,9 @@ SEED_ENGINEERS = {
     "ozerov": {"name": "Озеров", "code": "9", "is_admin": False},
 }
 
+# This account can never be removed by another admin.
+PROTECTED_ENGINEER_KEY = "podkolodny"
+
 NUMBER_TYPES = {
     "standard": {"name": "Обычный акт"},
     "thermo": {"name": "Узел терморегистрации"},
@@ -871,6 +874,12 @@ def api_admin_delete_engineer(key):
             "code": "CANNOT_DELETE_SELF",
         }), 400
 
+    if key == PROTECTED_ENGINEER_KEY:
+        return jsonify({
+            "error": "Эту учётную запись нельзя удалить",
+            "code": "PROTECTED_ENGINEER",
+        }), 400
+
     with db() as con:
         row = con.execute(
             "SELECT is_admin FROM engineers WHERE key = ? AND status = 'active'",
@@ -937,6 +946,12 @@ def api_admin_demote_engineer(key):
             "error": "Недостаточно прав",
             "code": "FORBIDDEN",
         }), 403
+
+    if key == PROTECTED_ENGINEER_KEY:
+        return jsonify({
+            "error": "Нельзя снять права администратора с этой учётной записи",
+            "code": "PROTECTED_ENGINEER",
+        }), 400
 
     with db() as con:
         row = con.execute(
