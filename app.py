@@ -1,31 +1,17 @@
 
 from flask_cors import CORS
-from functools import partial
 import csv
 import io
+import json
 import os
 import sqlite3
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime
-from io import BytesIO
+from datetime import datetime, timedelta
 
 import requests
 from dotenv import load_dotenv
-from flask import (
-    Flask,
-    flash,
-    jsonify,
-    redirect,
-    render_template,
-    request,
-    send_file,
-    session,
-    url_for,
-)
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+from flask import Flask, jsonify, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -295,6 +281,36 @@ def init_db():
                 "REFERENCES acts(id)"
             )
 
+        # Soft delete: a deleted act gets a DEL-NNNN number, its old number
+        # is kept in original_act_number and becomes free for new acts.
+        for column in ("deleted_at", "deleted_by", "original_act_number"):
+            if column not in columns:
+                con.execute(f"ALTER TABLE acts ADD COLUMN {column} TEXT")
+
+        # Counters that must never go back, even after rows are purged.
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS sequences ("
+            "name TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+        )
+
+        # Previous states of edited acts (admin-only "Версии актов").
+        # data is a JSON snapshot in the same shape as GET /api/acts/<id>.
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS act_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                act_id INTEGER NOT NULL REFERENCES acts(id),
+                version_number TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_act_versions_act
+                ON act_versions(act_id);
+            """
+        )
+
         # Legacy acts were saved without a condition; they are all working.
         # Thermo acts have no condition at all, so they are left alone.
         con.execute(
@@ -403,13 +419,6 @@ def get_engineer():
         "code": row["code"],
         "is_admin": bool(row["is_admin"]),
     }
-
-
-def require_engineer():
-    if not get_engineer():
-        flash("Сначала выберите инженера.", "warning")
-        return False
-    return True
 
 
 def require_admin():
@@ -635,67 +644,6 @@ def save_manual_device(con, values, now):
         ),
     )
     return cursor.lastrowid
-
-
-def form_values():
-    names = [
-        "customer_name",
-        "customer_representative",
-        "device_model",
-        "serial_number",
-        "printeco_label",
-        "device_type",
-        "comment_label",
-        "address",
-        "phone",
-        "fault",
-        "counter_bw",
-        "counter_color",
-        "service_kind",
-        "diagnostics_result",
-        "works_text",
-        "materials_text",
-        "work_date",
-        "start_time",
-        "end_time",
-        "device_condition",
-        "customer_signatory",
-        "intraservice_task_id",
-    ]
-
-    values = {}
-    for name in names:
-        value = request.form.get(name, "")
-        if name == "materials_text":
-            values[name] = clean_multiline(value)
-        else:
-            values[name] = clean(value)
-    return values
-
-
-@app.route("/")
-def home():
-    engineer = get_engineer()
-    if not engineer:
-        return redirect(url_for("choose_engineer"))
-    return render_template("home.html", engineer=engineer)
-
-
-@app.route("/engineer", methods=["GET", "POST"])
-def choose_engineer():
-    if request.method == "POST":
-        flash(
-            "Вход через эту страницу отключён. "
-            "Используйте веб-приложение.",
-            "danger",
-        )
-    return render_template("engineer.html", engineers=get_engineers_dict())
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("choose_engineer"))
 
 
 @app.route("/api/session", methods=["GET"])
@@ -1099,118 +1047,10 @@ def api_admin_demote_engineer(key):
     return jsonify({"is_admin": False})
 
 
-@app.route("/devices")
-def devices():
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    q = clean(request.args.get("q", ""))
-    tasks = []
-    intraservice_error = None
-
-    with db() as con:
-        base_rows = con.execute(
-            """
-            SELECT *
-            FROM devices
-            ORDER BY imported_at DESC, serial_number
-            LIMIT 1000
-            """
-        ).fetchall()
-
-    if q:
-        q_norm = q.lower()
-        device_rows = [
-            row
-            for row in base_rows
-            if (
-                q_norm in (row["serial_number"] or "").lower()
-                or q_norm in (row["customer_name"] or "").lower()
-                or q_norm in (row["model"] or "").lower()
-            )
-        ]
-    else:
-        device_rows = base_rows
-
-    if q:
-        try:
-            tasks = search_intraservice(q)
-        except requests.RequestException as exc:
-            intraservice_error = str(exc)
-        except Exception as exc:
-            intraservice_error = str(exc)
-
-    return render_template(
-        "devices.html",
-        devices=device_rows,
-        tasks=tasks,
-        intraservice_error=intraservice_error,
-        q=q,
-        engineer=get_engineer(),
-    )
-
-
-@app.route("/sync-devices", methods=["POST"])
-def sync_devices():
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    try:
-        count = import_google_sheet()
-        flash(f"Справочник обновлен: обработано строк — {count}.", "success")
-    except Exception as exc:
-        flash(f"Не удалось загрузить Google Sheets: {exc}", "danger")
-    return redirect(request.referrer or url_for("devices"))
-
-
-@app.route("/acts/new/<int:device_id>")
-def new_act(device_id):
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    with db() as con:
-        device = con.execute(
-            "SELECT * FROM devices WHERE id = ?",
-            (device_id,),
-        ).fetchone()
-
-    if not device:
-        flash("Аппарат не найден.", "danger")
-        return redirect(url_for("devices"))
-
-    return render_template(
-        "act_form.html",
-        act=None,
-        device=device,
-        engineer=get_engineer(),
-        intraservice_task_id=clean(
-            request.args.get("intraservice_task_id", "")
-        ),
-        today=datetime.now().strftime("%Y-%m-%d"),
-    )
-
-
-@app.route("/acts/new-manual")
-def new_act_manual():
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    return render_template(
-        "act_form.html",
-        act=None,
-        device=None,
-        engineer=get_engineer(),
-        intraservice_task_id=clean(
-            request.args.get("intraservice_task_id", "")
-        ),
-        today=datetime.now().strftime("%Y-%m-%d"),
-    )
-
-
 @app.route("/api/intraservice/search")
 def api_intraservice_search():
-    if not require_engineer():
-        return {"error": "Не выбран инженер"}, 403
+    if not get_engineer():
+        return unauthenticated()
 
     query = clean(request.args.get("q", ""))
     if not query:
@@ -1224,647 +1064,6 @@ def api_intraservice_search():
         return {"error": f"Intraservice connection error: {exc}"}, 502
     except Exception as exc:
         return {"error": f"Intraservice error: {exc}"}, 500
-
-
-@app.route("/acts/save", methods=["POST"])
-def save_act():
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    engineer_key = session["engineer_key"]
-    engineer = get_engineer()
-    now = datetime.now()
-    act_id = request.form.get("act_id")
-    status = request.form.get("status", "draft")
-    number_type = request.form.get("number_type", "standard")
-
-    if status not in {"draft", "completed"}:
-        status = "draft"
-    if number_type not in NUMBER_TYPES:
-        number_type = "standard"
-
-    values = form_values()
-
-    with db() as con:
-        form_device_id = request.form.get("source_device_id") or None
-        manual_device_id = save_manual_device(con, values, now)
-        source_device_id = manual_device_id or form_device_id
-
-        if act_id:
-            existing = con.execute(
-                "SELECT * FROM acts WHERE id = ?",
-                (act_id,),
-            ).fetchone()
-
-            if not existing:
-                flash("Акт не найден.", "danger")
-                return redirect(url_for("acts"))
-
-            manual_number = clean(request.form.get("act_number"))
-            new_number = manual_number or existing["act_number"]
-
-            if (
-                existing["status"] == "draft"
-                and status == "completed"
-                and not manual_number
-            ):
-                new_number = next_act_number(
-                    con,
-                    engineer["code"],
-                    now,
-                    values["device_condition"],
-                    number_type,
-                )
-
-            con.execute(
-                """
-                UPDATE acts SET
-                    act_number=?, number_type=?, updated_at=?, status=?,
-                    customer_name=?, customer_representative=?, device_model=?,
-                    serial_number=?, printeco_label=?, device_type=?,
-                    comment_label=?, address=?, phone=?, fault=?,
-                    counter_bw=?, counter_color=?, service_kind=?,
-                    diagnostics_result=?, works_text=?, materials_text=?,
-                    work_date=?, start_time=?, end_time=?, device_condition=?,
-                    customer_signatory=?, source_device_id=?,
-                    intraservice_task_id=?
-                WHERE id=?
-                """,
-                (
-                    new_number,
-                    number_type,
-                    now.isoformat(timespec="seconds"),
-                    status,
-                    values["customer_name"],
-                    values["customer_representative"],
-                    values["device_model"],
-                    values["serial_number"],
-                    values["printeco_label"],
-                    values["device_type"],
-                    values["comment_label"],
-                    values["address"],
-                    values["phone"],
-                    values["fault"],
-                    values["counter_bw"],
-                    values["counter_color"],
-                    values["service_kind"],
-                    values["diagnostics_result"],
-                    values["works_text"],
-                    values["materials_text"],
-                    values["work_date"],
-                    values["start_time"],
-                    values["end_time"],
-                    values["device_condition"],
-                    values["customer_signatory"],
-                    source_device_id,
-                    values["intraservice_task_id"],
-                    act_id,
-                ),
-            )
-            saved_id = int(act_id)
-        else:
-            manual_number = clean(request.form.get("act_number"))
-            number = manual_number or next_act_number(
-                con,
-                engineer["code"],
-                now,
-                values["device_condition"],
-                number_type,
-            )
-
-            cursor = con.execute(
-                """
-                INSERT INTO acts (
-                    act_number, number_type, engineer_key, engineer_name,
-                    engineer_code, created_at, updated_at, status,
-                    customer_name, customer_representative, device_model,
-                    serial_number, printeco_label, device_type, comment_label,
-                    address, phone, fault, counter_bw, counter_color,
-                    service_kind, diagnostics_result, works_text, materials_text,
-                    work_date, start_time, end_time, device_condition,
-                    customer_signatory, source_device_id, intraservice_task_id
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                """,
-                (
-                    number,
-                    number_type,
-                    engineer_key,
-                    engineer["name"],
-                    engineer["code"],
-                    now.isoformat(timespec="seconds"),
-                    now.isoformat(timespec="seconds"),
-                    status,
-                    values["customer_name"],
-                    values["customer_representative"],
-                    values["device_model"],
-                    values["serial_number"],
-                    values["printeco_label"],
-                    values["device_type"],
-                    values["comment_label"],
-                    values["address"],
-                    values["phone"],
-                    values["fault"],
-                    values["counter_bw"],
-                    values["counter_color"],
-                    values["service_kind"],
-                    values["diagnostics_result"],
-                    values["works_text"],
-                    values["materials_text"],
-                    values["work_date"],
-                    values["start_time"],
-                    values["end_time"],
-                    values["device_condition"],
-                    values["customer_signatory"],
-                    source_device_id,
-                    values["intraservice_task_id"],
-                ),
-            )
-            saved_id = cursor.lastrowid
-
-    flash("Акт сохранен.", "success")
-    return redirect(url_for("edit_act", act_id=saved_id))
-
-
-@app.route("/acts")
-def acts():
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    q = clean(request.args.get("q", ""))
-    engineer_filter = request.args.get("engineer", "")
-    status_filter = request.args.get("status", "")
-    date_sort = request.args.get("date_sort", "newest")
-    date_from = clean(request.args.get("date_from", ""))
-    date_to = clean(request.args.get("date_to", ""))
-
-    if date_sort not in {"newest", "oldest"}:
-        date_sort = "newest"
-
-    engineers_dict = get_engineers_dict()
-
-    sql = "SELECT * FROM acts WHERE 1=1"
-    params = []
-
-    if engineer_filter in engineers_dict:
-        sql += " AND engineer_key = ?"
-        params.append(engineer_filter)
-    if status_filter in {"draft", "completed"}:
-        sql += " AND status = ?"
-        params.append(status_filter)
-    if date_from:
-        sql += " AND date(created_at) >= date(?)"
-        params.append(date_from)
-    if date_to:
-        sql += " AND date(created_at) <= date(?)"
-        params.append(date_to)
-
-    direction = "ASC" if date_sort == "oldest" else "DESC"
-    sql += f" ORDER BY datetime(created_at) {direction}, id {direction} LIMIT 200"
-
-    with db() as con:
-        base_rows = con.execute(sql, params).fetchall()
-
-    if q:
-        q_norm = q.lower()
-        rows = [
-            row
-            for row in base_rows
-            if (
-                q_norm in (row["act_number"] or "").lower()
-                or q_norm in (row["serial_number"] or "").lower()
-                or q_norm in (row["customer_name"] or "").lower()
-                or q_norm in (row["device_model"] or "").lower()
-            )
-        ]
-    else:
-        rows = base_rows
-
-    return render_template(
-        "acts.html",
-        acts=rows,
-        q=q,
-        engineers=engineers_dict,
-        engineer_filter=engineer_filter,
-        status_filter=status_filter,
-        date_sort=date_sort,
-        date_from=date_from,
-        date_to=date_to,
-        engineer=get_engineer(),
-    )
-
-
-@app.route("/acts/export.xlsx")
-def export_acts():
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    q = clean(request.args.get("q", ""))
-    engineer_filter = request.args.get("engineer", "")
-    status_filter = request.args.get("status", "")
-    date_sort = request.args.get("date_sort", "newest")
-    date_from = clean(request.args.get("date_from", ""))
-    date_to = clean(request.args.get("date_to", ""))
-
-    if date_sort not in {"newest", "oldest"}:
-        date_sort = "newest"
-
-    sql = """
-        SELECT
-            serial_number,
-            customer_name,
-            engineer_name,
-            materials_text,
-            work_date
-        FROM acts
-        WHERE 1=1
-    """
-    params = []
-
-    if engineer_filter in get_engineers_dict():
-        sql += " AND engineer_key = ?"
-        params.append(engineer_filter)
-    if status_filter in {"draft", "completed"}:
-        sql += " AND status = ?"
-        params.append(status_filter)
-    if date_from:
-        sql += " AND date(created_at) >= date(?)"
-        params.append(date_from)
-    if date_to:
-        sql += " AND date(created_at) <= date(?)"
-        params.append(date_to)
-
-    direction = "ASC" if date_sort == "oldest" else "DESC"
-    sql += f" ORDER BY datetime(created_at) {direction}, id {direction}"
-
-    with db() as con:
-        rows = con.execute(sql, params).fetchall()
-
-    if q:
-        q_lower = q.lower()
-        rows = [
-            row
-            for row in rows
-            if (
-                q_lower in (row["serial_number"] or "").lower()
-                or q_lower in (row["customer_name"] or "").lower()
-                or q_lower in (row["engineer_name"] or "").lower()
-                or q_lower in (row["materials_text"] or "").lower()
-            )
-        ]
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Результаты"
-
-    headers = [
-        ("Серийный номер", "serial_number"),
-        ("Заказчик", "customer_name"),
-        ("Инженер", "engineer_name"),
-        ("ЗИП", "materials_text"),
-        ("Дата ремонта", "work_date"),
-    ]
-
-    ws.append([title for title, _ in headers])
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for row in rows:
-        ws.append([row[key] or "" for _, key in headers])
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    widths = {
-        "serial_number": 22,
-        "customer_name": 35,
-        "engineer_name": 22,
-        "materials_text": 45,
-        "work_date": 16,
-    }
-
-    for index, (_, key) in enumerate(headers, start=1):
-        ws.column_dimensions[get_column_letter(index)].width = widths[key]
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-
-    filename = f"rezultaty_aktov_{datetime.now():%Y-%m-%d}.xlsx"
-
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=filename,
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-    )
-
-
-@app.route("/acts/export-short.xlsx")
-def export_short_acts():
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    q = clean(request.args.get("q", ""))
-    engineer_filter = request.args.get("engineer", "")
-    status_filter = request.args.get("status", "")
-    date_sort = request.args.get("date_sort", "newest")
-    date_from = clean(request.args.get("date_from", ""))
-    date_to = clean(request.args.get("date_to", ""))
-
-    if date_sort not in {"newest", "oldest"}:
-        date_sort = "newest"
-
-    sql = "SELECT * FROM acts WHERE 1=1"
-    params = []
-
-    if engineer_filter in get_engineers_dict():
-        sql += " AND engineer_key = ?"
-        params.append(engineer_filter)
-
-    if status_filter in {"draft", "completed"}:
-        sql += " AND status = ?"
-        params.append(status_filter)
-
-    if date_from:
-        sql += " AND date(created_at) >= date(?)"
-        params.append(date_from)
-
-    if date_to:
-        sql += " AND date(created_at) <= date(?)"
-        params.append(date_to)
-
-    direction = "ASC" if date_sort == "oldest" else "DESC"
-    sql += f" ORDER BY datetime(created_at) {direction}, id {direction}"
-
-    with db() as con:
-        rows = con.execute(sql, params).fetchall()
-
-    if q:
-        q_lower = q.lower()
-        rows = [
-            row
-            for row in rows
-            if (
-                q_lower in (row["act_number"] or "").lower()
-                or q_lower in (row["serial_number"] or "").lower()
-                or q_lower in (row["customer_name"] or "").lower()
-                or q_lower in (row["device_model"] or "").lower()
-            )
-        ]
-
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Краткая выгрузка"
-
-    worksheet.append(["Заказчик", "Серийный номер"])
-
-    for cell in worksheet[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for row in rows:
-        worksheet.append([
-            row["customer_name"] or "",
-            row["serial_number"] or "",
-        ])
-
-    worksheet.column_dimensions["A"].width = 40
-    worksheet.column_dimensions["B"].width = 25
-    worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = worksheet.dimensions
-
-    for row in worksheet.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-    output = BytesIO()
-    workbook.save(output)
-    output.seek(0)
-
-    filename = f"kratkaya_vygruzka_{datetime.now():%Y-%m-%d}.xlsx"
-
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=filename,
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-    )
-
-
-@app.route("/acts/<int:act_id>")
-def edit_act(act_id):
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    with db() as con:
-        act = con.execute(
-            "SELECT * FROM acts WHERE id = ?",
-            (act_id,),
-        ).fetchone()
-
-    if not act:
-        flash("Акт не найден.", "danger")
-        return redirect(url_for("acts"))
-
-    return render_template(
-        "act_form.html",
-        act=act,
-        device=None,
-        engineer=get_engineer(),
-        intraservice_task_id=act["intraservice_task_id"] or "",
-        today=datetime.now().strftime("%Y-%m-%d"),
-    )
-
-
-@app.route("/acts/<int:act_id>/print")
-def print_act(act_id):
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    with db() as con:
-        act = con.execute(
-            "SELECT * FROM acts WHERE id = ?",
-            (act_id,),
-        ).fetchone()
-
-    if not act:
-        flash("Акт не найден.", "danger")
-        return redirect(url_for("acts"))
-
-    return render_template("act_print.html", act=act)
-
-
-@app.route("/acts/<int:act_id>/delete", methods=["POST"])
-def delete_act_web(act_id):
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    with db() as con:
-        act = con.execute(
-            "SELECT id, act_number FROM acts WHERE id = ?",
-            (act_id,),
-        ).fetchone()
-        if not act:
-            flash("Акт не найден.", "danger")
-            return redirect(url_for("acts"))
-        con.execute("DELETE FROM act_materials WHERE act_id = ?", (act_id,))
-        con.execute("DELETE FROM acts WHERE id = ?", (act_id,))
-
-    flash(f"Акт {act['act_number']} удален.", "success")
-    return redirect(url_for("acts"))
-
-
-@app.route("/acts/<int:act_id>/renumber", methods=["POST"])
-def renumber_act(act_id):
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    new_number = clean(request.form.get("new_number"))
-    if not new_number:
-        flash("Введите новый номер.", "danger")
-        return redirect(url_for("edit_act", act_id=act_id))
-
-    with db() as con:
-        act = con.execute(
-            "SELECT id, act_number FROM acts WHERE id = ?",
-            (act_id,),
-        ).fetchone()
-        if not act:
-            flash("Акт не найден.", "danger")
-            return redirect(url_for("acts"))
-
-        duplicate = con.execute(
-            "SELECT id FROM acts WHERE act_number = ? AND id <> ?",
-            (new_number, act_id),
-        ).fetchone()
-        if duplicate:
-            flash("Такой номер уже используется.", "danger")
-            return redirect(url_for("edit_act", act_id=act_id))
-
-        con.execute(
-            """
-            UPDATE acts
-            SET act_number=?, updated_at=?
-            WHERE id=?
-            """,
-            (
-                new_number,
-                datetime.now().isoformat(timespec="seconds"),
-                act_id,
-            ),
-        )
-
-    flash(f"Номер изменён: {act['act_number']} → {new_number}.", "success")
-    return redirect(url_for("edit_act", act_id=act_id))
-
-
-@app.route("/acts/<int:act_id>/export.xlsx")
-def export_filled_act(act_id):
-    if not require_engineer():
-        return redirect(url_for("choose_engineer"))
-
-    with db() as con:
-        act = con.execute(
-            "SELECT * FROM acts WHERE id = ?",
-            (act_id,),
-        ).fetchone()
-
-    if not act:
-        flash("Акт не найден.", "danger")
-        return redirect(url_for("acts"))
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Акт"
-
-    rows = [
-        ("Внутренний номер", act["act_number"]),
-        (
-            "Тип нумерации",
-            NUMBER_TYPES.get(
-                act["number_type"],
-                NUMBER_TYPES["standard"],
-            )["name"],
-        ),
-        (
-            "Статус",
-            "Черновик" if act["status"] == "draft" else "Завершён",
-        ),
-        ("Заказчик", act["customer_name"]),
-        ("Инженер", act["engineer_name"]),
-        ("Модель аппарата", act["device_model"]),
-        ("Серийный номер", act["serial_number"]),
-        ("Маркировка ПРИНТЭКО", act["printeco_label"]),
-        ("Тип аппарата", act["device_type"]),
-        ("Счётчик ч/б", act["counter_bw"]),
-        ("Счётчик цветной", act["counter_color"]),
-        ("Вид услуги", act["service_kind"]),
-        ("Результат диагностики", act["diagnostics_result"]),
-        ("Выполненные работы", act["works_text"]),
-        ("ЗИП / материалы", act["materials_text"]),
-        ("Дата ремонта", act["work_date"]),
-        ("Время начала", act["start_time"]),
-        ("Время окончания", act["end_time"]),
-        ("Состояние аппарата", act["device_condition"]),
-        ("Подписант заказчика", act["customer_signatory"]),
-        ("Создан", act["created_at"]),
-        ("Изменён", act["updated_at"]),
-    ]
-
-    ws.append(["Поле", "Значение"])
-    for key, value in rows:
-        ws.append([key, value or ""])
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for cell in ws["A"][1:]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="D9EAF7")
-
-    ws.column_dimensions["A"].width = 32
-    ws.column_dimensions["B"].width = 70
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-
-    filename = f"act_{clean(act['act_number']) or act_id}.xlsx"
-
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=filename,
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-    )
 
 
 @app.route("/api/engineers", methods=["GET"])
@@ -1971,10 +1170,12 @@ ACT_LIST_SQL = """
     SELECT
         a.*,
         repaired.act_number AS repaired_by_act_number,
-        original.act_number AS repair_of_act_number
+        original.act_number AS repair_of_act_number,
+        deleter.name AS deleted_by_name
     FROM acts a
     LEFT JOIN acts repaired ON repaired.id = a.repaired_by_act_id
     LEFT JOIN acts original ON original.id = a.repair_of_act_id
+    LEFT JOIN engineers deleter ON deleter.key = a.deleted_by
 """
 
 
@@ -2001,6 +1202,8 @@ def act_state(act):
 
 
 def can_edit_act(act, engineer_key, engineer):
+    if act["deleted_at"]:
+        return False
     if engineer["is_admin"]:
         return True
     # A repaired original is a historical record: admins only.
@@ -2011,9 +1214,19 @@ def can_edit_act(act, engineer_key, engineer):
 
 def can_repair_act(act):
     return (
-        act["device_condition"] == CONDITION_BROKEN
+        not act["deleted_at"]
+        and act["device_condition"] == CONDITION_BROKEN
         and not act["repaired_by_act_id"]
     )
+
+
+def can_delete_act(act, engineer_key, engineer):
+    if act["deleted_at"]:
+        return False
+    # An original with a live repaired copy: the copy must be deleted first.
+    if act["repaired_by_act_id"]:
+        return False
+    return engineer["is_admin"] or act["engineer_key"] == engineer_key
 
 
 def linked_act(act_id, act_number):
@@ -2064,21 +1277,13 @@ def act_detail(con, act, engineer_key, engineer):
         "materials": get_act_materials(con, act["id"]),
         "can_edit": can_edit_act(act, engineer_key, engineer),
         "can_repair": can_repair_act(act),
+        "can_delete": can_delete_act(act, engineer_key, engineer),
+        "is_deleted": bool(act["deleted_at"]),
+        "deleted_at": act["deleted_at"] or "",
+        "deleted_by_name": act["deleted_by_name"] or "",
+        "original_act_number": act["original_act_number"] or "",
     })
     return data
-
-
-def format_materials_text(materials):
-    """Keep the legacy materials_text column in sync for xlsx exports."""
-    lines = []
-    for item in materials:
-        if item["name"] or item["article"] or item["quantity"]:
-            lines.append(
-                f"Наименование: {item['name']}; "
-                f"Артикул: {item['article']}; "
-                f"Кол-во: {item['quantity']}"
-            )
-    return "\n".join(lines)
 
 
 def read_act_payload(data, number_type="standard"):
@@ -2171,13 +1376,13 @@ def insert_act(
     columns = [
         "act_number", "number_type", "engineer_key", "engineer_name",
         "engineer_code", "created_at", "updated_at", "status",
-        "device_condition", "materials_text", "source_device_id",
+        "device_condition", "source_device_id",
         "repair_of_act_id",
     ] + ACT_TEXT_FIELDS
     row = [
         number, number_type, engineer_key, engineer["name"],
         engineer["code"], timestamp, timestamp, "completed",
-        condition, format_materials_text(materials), source_device_id,
+        condition, source_device_id,
         repair_of_act_id,
     ] + [values[name] for name in ACT_TEXT_FIELDS]
 
@@ -2210,7 +1415,7 @@ def api_acts_list():
     date_from = clean(request.args.get("date_from", ""))
     date_to = clean(request.args.get("date_to", ""))
 
-    sql = ACT_LIST_SQL + " WHERE a.number_type = ?"
+    sql = ACT_LIST_SQL + " WHERE a.number_type = ? AND a.deleted_at IS NULL"
     params = [number_type]
 
     if engineer_filter in get_engineers_dict():
@@ -2275,7 +1480,8 @@ def api_act_detail(act_id):
 
     with db() as con:
         act = load_act(con, act_id)
-        if not act:
+        # Deleted acts are visible only to admins (the "Удалённые акты" page).
+        if not act or (act["deleted_at"] and not engineer["is_admin"]):
             return api_error("Акт не найден", "NOT_FOUND", 404)
         return jsonify(
             act_detail(con, act, session["engineer_key"], engineer)
@@ -2340,7 +1546,7 @@ def api_act_update(act_id):
 
     with db() as con:
         act = load_act(con, act_id)
-        if not act:
+        if not act or act["deleted_at"]:
             return api_error("Акт не найден", "NOT_FOUND", 404)
 
         if not can_edit_act(act, engineer_key, engineer):
@@ -2373,16 +1579,61 @@ def api_act_update(act_id):
                 400,
             )
 
+        # Only an admin may change the act number by hand (free format).
+        act_number = act["act_number"]
+        if "act_number" in data:
+            act_number = clean(str(data.get("act_number") or ""))
+        if act_number != act["act_number"]:
+            if not engineer["is_admin"]:
+                return api_error(
+                    "Изменить номер акта может только администратор",
+                    "FORBIDDEN",
+                    403,
+                )
+            if not act_number:
+                return api_error(
+                    "Номер акта не может быть пустым", "VALIDATION_ERROR", 400
+                )
+            # DEL-NNNN is reserved for deleted acts.
+            if act_number.upper().startswith("DEL-"):
+                return api_error(
+                    "Номера DEL-… зарезервированы для удалённых актов",
+                    "VALIDATION_ERROR",
+                    400,
+                )
+            duplicate = con.execute(
+                "SELECT 1 FROM acts WHERE act_number = ? AND id <> ?",
+                (act_number, act_id),
+            ).fetchone()
+            if duplicate:
+                return api_error(
+                    f"Номер {act_number} уже занят другим актом",
+                    "NUMBER_TAKEN",
+                    409,
+                )
+
+        # Keep the previous state as a version, but only if something changed.
+        old_materials = get_act_materials(con, act_id)
+        changed = (
+            act_number != act["act_number"]
+            or materials != old_materials
+            or any(
+                values[name] != (act[name] or "") for name in ACT_TEXT_FIELDS
+            )
+        )
+        if changed:
+            save_act_version(con, act, engineer_key, engineer, now)
+
         source_device_id = (
             None if thermo
             else resolve_source_device(con, data, values, now)
         )
         assignments =", ".join(f"{name} = ?" for name in ACT_TEXT_FIELDS)
         con.execute(
-            f"UPDATE acts SET {assignments}, materials_text = ?, "
+            f"UPDATE acts SET {assignments}, act_number = ?, "
             "source_device_id = ?, updated_at = ? WHERE id = ?",
             [values[name] for name in ACT_TEXT_FIELDS] + [
-                format_materials_text(materials),
+                act_number,
                 source_device_id,
                 now.isoformat(timespec="seconds"),
                 act_id,
@@ -2411,7 +1662,7 @@ def api_act_repair(act_id):
 
     with db() as con:
         original = load_act(con, act_id)
-        if not original:
+        if not original or original["deleted_at"]:
             return api_error("Акт не найден", "NOT_FOUND", 404)
 
         if original["device_condition"] != CONDITION_BROKEN:
@@ -2460,6 +1711,7 @@ def api_acts_stats():
             SUM(number_type = 'standard' AND device_condition = ?) AS broken,
             SUM(number_type = 'thermo') AS thermo
         FROM acts
+        WHERE deleted_at IS NULL
     """
 
     with db() as con:
@@ -2467,7 +1719,7 @@ def api_acts_stats():
             sql, (CONDITION_WORKING, CONDITION_BROKEN)
         ).fetchone()
         month = con.execute(
-            sql + " WHERE work_date LIKE ?",
+            sql + " AND work_date LIKE ?",
             (CONDITION_WORKING, CONDITION_BROKEN, month_prefix),
         ).fetchone()
 
@@ -2477,6 +1729,419 @@ def api_acts_stats():
     return jsonify({"total": counters(total), "month": counters(month)})
 
 
+def next_sequence_value(con, name):
+    """Next value of a counter that never repeats, even after purges."""
+    con.execute(
+        "INSERT INTO sequences (name, value) VALUES (?, 1) "
+        "ON CONFLICT(name) DO UPDATE SET value = value + 1",
+        (name,),
+    )
+    return con.execute(
+        "SELECT value FROM sequences WHERE name = ?",
+        (name,),
+    ).fetchone()["value"]
+
+
+@app.route("/api/acts/<int:act_id>", methods=["DELETE"])
+def api_act_delete(act_id):
+    """Move an act to the admin-only "Удалённые акты" list.
+
+    The act gets a DEL-NNNN number; its old number is kept in
+    original_act_number and may be given to a new act later.
+    """
+    engineer = get_engineer()
+    if not engineer:
+        return unauthenticated()
+
+    engineer_key = session["engineer_key"]
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with db() as con:
+        act = load_act(con, act_id)
+        if not act or act["deleted_at"]:
+            return api_error("Акт не найден", "NOT_FOUND", 404)
+
+        if act["repaired_by_act_id"]:
+            return api_error(
+                f"Сначала удалите акт ремонта {act['repaired_by_act_number']}",
+                "HAS_REPAIR_COPY",
+                409,
+            )
+        if not can_delete_act(act, engineer_key, engineer):
+            return api_error(
+                "Нет прав на удаление этого акта", "FORBIDDEN", 403
+            )
+
+        deleted_number = f"DEL-{next_sequence_value(con, 'deleted_acts'):04d}"
+        con.execute(
+            "UPDATE acts SET act_number = ?, original_act_number = ?, "
+            "deleted_at = ?, deleted_by = ?, updated_at = ? WHERE id = ?",
+            (deleted_number, act["act_number"], now, engineer_key, now, act_id),
+        )
+        # Deleting a repaired copy makes the original "not repaired" again.
+        if act["repair_of_act_id"]:
+            con.execute(
+                "UPDATE acts SET repaired_by_act_id = NULL, updated_at = ? "
+                "WHERE id = ? AND repaired_by_act_id = ?",
+                (now, act["repair_of_act_id"], act_id),
+            )
+
+    return jsonify({"status": "deleted", "act_number": deleted_number})
+
+
+@app.route("/api/admin/deleted-acts", methods=["GET"])
+def api_admin_deleted_acts():
+    if not require_admin():
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    with db() as con:
+        rows = con.execute(
+            ACT_LIST_SQL
+            + " WHERE a.deleted_at IS NOT NULL"
+            " ORDER BY a.deleted_at DESC, a.id DESC"
+        ).fetchall()
+
+    return jsonify([
+        {
+            "id": row["id"],
+            "act_number": row["act_number"] or "",
+            "original_act_number": row["original_act_number"] or "",
+            "number_type": row["number_type"] or "standard",
+            "customer_name": row["customer_name"] or "",
+            "engineer_name": row["engineer_name"] or "",
+            "deleted_at": row["deleted_at"] or "",
+            "deleted_by_name": row["deleted_by_name"] or "",
+        }
+        for row in rows
+    ])
+
+
+def restore_deleted_act(con, act, now):
+    """Bring a deleted act back with a new number (inside the caller's
+    transaction).
+
+    The number uses the author's engineer code and the current month.
+    A restored repaired copy is linked to its original again, unless the
+    original has been repaired by another copy in the meantime.
+    Returns (new_number, None) or (None, error_response).
+    """
+    timestamp = now.isoformat(timespec="seconds")
+
+    original = (
+        load_act(con, act["repair_of_act_id"])
+        if act["repair_of_act_id"]
+        else None
+    )
+    relink = False
+    if original and not original["deleted_at"]:
+        if original["repaired_by_act_id"]:
+            return None, (jsonify({
+                "error": (
+                    f"Исходный акт {original['act_number']} уже "
+                    f"отремонтирован другим актом "
+                    f"{original['repaired_by_act_number']}"
+                ),
+                "code": "ORIGINAL_REPAIRED",
+                "repaired_by": {
+                    "id": original["repaired_by_act_id"],
+                    "act_number": original["repaired_by_act_number"],
+                },
+            }), 409)
+        relink = True
+
+    number = next_act_number(
+        con,
+        act["engineer_code"],
+        now,
+        act["device_condition"],
+        act["number_type"] or "standard",
+    )
+    con.execute(
+        "UPDATE acts SET act_number = ?, deleted_at = NULL, "
+        "deleted_by = NULL, original_act_number = NULL, updated_at = ? "
+        "WHERE id = ?",
+        (number, timestamp, act["id"]),
+    )
+    if relink:
+        con.execute(
+            "UPDATE acts SET repaired_by_act_id = ?, updated_at = ? "
+            "WHERE id = ?",
+            (act["id"], timestamp, original["id"]),
+        )
+    return number, None
+
+
+@app.route("/api/admin/deleted-acts/<int:act_id>/restore", methods=["POST"])
+def api_admin_restore_deleted_act(act_id):
+    if not require_admin():
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    with db() as con:
+        act = load_act(con, act_id)
+        if not act or not act["deleted_at"]:
+            return api_error("Удалённый акт не найден", "NOT_FOUND", 404)
+
+        number, error = restore_deleted_act(con, act, datetime.now())
+        if error:
+            return error
+
+    return jsonify({"id": act_id, "act_number": number})
+
+
+PURGE_PERIODS = {"all": None, "month": 30, "week": 7}
+
+
+@app.route("/api/admin/deleted-acts/purge", methods=["POST"])
+def api_admin_purge_deleted_acts():
+    """Permanently remove deleted acts.
+
+    Body: {"ids": [...]} for selected acts, or {"period": "all"|"month"|"week"}
+    for everything deleted within the last 30 / 7 days.
+    """
+    if not require_admin():
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("Неверный формат запроса", "BAD_REQUEST", 400)
+
+    sql = "SELECT id FROM acts WHERE deleted_at IS NOT NULL"
+    params = []
+
+    if "ids" in data:
+        ids = data["ids"]
+        if not isinstance(ids, list) or not all(
+            isinstance(item, int) for item in ids
+        ):
+            return api_error("Неверный список актов", "BAD_REQUEST", 400)
+        if not ids:
+            return jsonify({"purged": 0})
+        sql += f" AND id IN ({', '.join('?' for _ in ids)})"
+        params.extend(ids)
+    elif data.get("period") in PURGE_PERIODS:
+        days = PURGE_PERIODS[data["period"]]
+        if days is not None:
+            since = datetime.now() - timedelta(days=days)
+            sql += " AND deleted_at >= ?"
+            params.append(since.isoformat(timespec="seconds"))
+    else:
+        return api_error("Не выбраны акты для очистки", "BAD_REQUEST", 400)
+
+    with db() as con:
+        ids = [row["id"] for row in con.execute(sql, params).fetchall()]
+        if ids:
+            marks = ", ".join("?" for _ in ids)
+            # Other acts may still point at the purged ones.
+            con.execute(
+                f"UPDATE acts SET repair_of_act_id = NULL "
+                f"WHERE repair_of_act_id IN ({marks})",
+                ids,
+            )
+            con.execute(
+                f"UPDATE acts SET repaired_by_act_id = NULL "
+                f"WHERE repaired_by_act_id IN ({marks})",
+                ids,
+            )
+            con.execute(
+                f"DELETE FROM act_materials WHERE act_id IN ({marks})", ids
+            )
+            con.execute(
+                f"DELETE FROM act_versions WHERE act_id IN ({marks})", ids
+            )
+            con.execute(f"DELETE FROM acts WHERE id IN ({marks})", ids)
+
+    return jsonify({"purged": len(ids)})
+
+
+def save_act_version(con, act, engineer_key, engineer, now):
+    """Store the current (pre-edit) state of an act as <number>/N."""
+    index = next_sequence_value(con, f"act_versions:{act['id']}")
+    snapshot = act_detail(con, act, engineer_key, engineer)
+    con.execute(
+        "INSERT INTO act_versions "
+        "(act_id, version_number, created_at, created_by, data) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            act["id"],
+            f"{act['act_number']}/{index}",
+            now.isoformat(timespec="seconds"),
+            engineer_key,
+            json.dumps(snapshot, ensure_ascii=False),
+        ),
+    )
+
+
+ACT_VERSIONS_SQL = """
+    SELECT
+        v.id, v.act_id, v.version_number, v.created_at, v.data,
+        editor.name AS created_by_name,
+        a.act_number AS current_act_number,
+        a.deleted_at AS act_deleted_at
+    FROM act_versions v
+    JOIN acts a ON a.id = v.act_id
+    LEFT JOIN engineers editor ON editor.key = v.created_by
+"""
+
+
+def act_version_item(row):
+    data = json.loads(row["data"])
+    return {
+        "id": row["id"],
+        "act_id": row["act_id"],
+        "version_number": row["version_number"],
+        "created_at": row["created_at"],
+        "created_by_name": row["created_by_name"] or "",
+        "current_act_number": row["current_act_number"] or "",
+        "act_deleted": bool(row["act_deleted_at"]),
+        "number_type": data.get("number_type", "standard"),
+        "customer_name": data.get("customer_name", ""),
+    }
+
+
+@app.route("/api/admin/act-versions", methods=["GET"])
+def api_admin_act_versions():
+    if not require_admin():
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    with db() as con:
+        rows = con.execute(
+            ACT_VERSIONS_SQL + " ORDER BY v.created_at DESC, v.id DESC"
+        ).fetchall()
+
+    return jsonify([act_version_item(row) for row in rows])
+
+
+@app.route("/api/admin/act-versions/<int:version_id>", methods=["GET"])
+def api_admin_act_version(version_id):
+    if not require_admin():
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    with db() as con:
+        row = con.execute(
+            ACT_VERSIONS_SQL + " WHERE v.id = ?",
+            (version_id,),
+        ).fetchone()
+
+    if not row:
+        return api_error("Версия не найдена", "NOT_FOUND", 404)
+
+    item = act_version_item(row)
+    item["act"] = json.loads(row["data"])
+    return jsonify(item)
+
+
+@app.route(
+    "/api/admin/act-versions/<int:version_id>/restore", methods=["POST"]
+)
+def api_admin_restore_act_version(version_id):
+    """Replace the act's content with a version and drop all its versions.
+
+    The act number stays as it is now; the current content is not kept.
+    If the act is deleted, it is restored first (new number), all in one
+    transaction: either both steps happen or neither.
+    """
+    engineer = get_engineer()
+    if not engineer or not engineer["is_admin"]:
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    now = datetime.now()
+
+    with db() as con:
+        version = con.execute(
+            "SELECT act_id, data FROM act_versions WHERE id = ?",
+            (version_id,),
+        ).fetchone()
+        if not version:
+            return api_error("Версия не найдена", "NOT_FOUND", 404)
+
+        act = load_act(con, version["act_id"])
+        if act["deleted_at"]:
+            _, error = restore_deleted_act(con, act, now)
+            if error:
+                # restore_deleted_act checks before writing, so nothing has
+                # changed; rollback is just a safety net.
+                con.rollback()
+                return error
+
+        snapshot = json.loads(version["data"])
+        assignments = ", ".join(f"{name} = ?" for name in ACT_TEXT_FIELDS)
+        con.execute(
+            f"UPDATE acts SET {assignments}, source_device_id = ?, "
+            "updated_at = ? WHERE id = ?",
+            [snapshot.get(name, "") for name in ACT_TEXT_FIELDS] + [
+                snapshot.get("source_device_id"),
+                now.isoformat(timespec="seconds"),
+                act["id"],
+            ],
+        )
+        save_act_materials(con, act["id"], snapshot.get("materials", []))
+        con.execute(
+            "DELETE FROM act_versions WHERE act_id = ?", (act["id"],)
+        )
+
+        act = load_act(con, act["id"])
+        return jsonify(
+            act_detail(con, act, session["engineer_key"], engineer)
+        )
+
+
+@app.route("/api/admin/act-versions/purge", methods=["POST"])
+def api_admin_purge_act_versions():
+    """Permanently remove versions: {"ids": [...]} or {"period": ...}."""
+    if not require_admin():
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("Неверный формат запроса", "BAD_REQUEST", 400)
+
+    sql = "DELETE FROM act_versions WHERE 1=1"
+    params = []
+
+    if "ids" in data:
+        ids = data["ids"]
+        if not isinstance(ids, list) or not all(
+            isinstance(item, int) for item in ids
+        ):
+            return api_error("Неверный список версий", "BAD_REQUEST", 400)
+        if not ids:
+            return jsonify({"purged": 0})
+        sql += f" AND id IN ({', '.join('?' for _ in ids)})"
+        params.extend(ids)
+    elif data.get("period") in PURGE_PERIODS:
+        days = PURGE_PERIODS[data["period"]]
+        if days is not None:
+            since = datetime.now() - timedelta(days=days)
+            sql += " AND created_at >= ?"
+            params.append(since.isoformat(timespec="seconds"))
+    else:
+        return api_error("Не выбраны версии для очистки", "BAD_REQUEST", 400)
+
+    with db() as con:
+        purged = con.execute(sql, params).rowcount
+
+    return jsonify({"purged": purged})
+
+
+@app.route("/api/admin/devices/sync", methods=["POST"])
+def api_admin_sync_devices():
+    """Reload the device catalogue from the Google Sheet."""
+    if not require_admin():
+        return api_error("Нет прав", "FORBIDDEN", 403)
+
+    try:
+        count = import_google_sheet()
+    except Exception as exc:
+        return api_error(
+            f"Не удалось загрузить Google-таблицу: {exc}", "SYNC_FAILED", 502
+        )
+    return jsonify({"imported": count})
+
+
+# Run schema migrations on import, so they are applied no matter how the app
+# is started (waitress imports app:app and never reaches __main__).
+# init_db is idempotent: every step checks what already exists.
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5000, debug=False)
