@@ -61,6 +61,19 @@ NUMBER_TYPES = {
     "thermo": {"name": "Узел терморегистрации"},
 }
 
+# Act state is the device condition. It is set once when the act is created
+# and never changes; a broken device is "repaired" by creating a copy act.
+CONDITION_WORKING = "Работает"
+CONDITION_BROKEN = "Не работает"
+DEVICE_CONDITIONS = {CONDITION_WORKING, CONDITION_BROKEN}
+
+MATERIAL_PREFIXES = [
+    ("Наименование:", "name"),
+    ("Парт:", "article"),
+    ("Артикул:", "article"),
+    ("Кол-во:", "quantity"),
+]
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get(
     "FLASK_SECRET_KEY",
@@ -97,6 +110,52 @@ def clean_multiline(value):
 
 def normalize_serial(value):
     return clean(value).upper().replace(" ", "")
+
+
+def parse_materials_text(text):
+    """Parse legacy "Наименование: X; Артикул: Y; Кол-во: Z" lines."""
+    items = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        item = {"name": "", "article": "", "quantity": ""}
+        for chunk in line.split(";"):
+            part = chunk.strip()
+            for prefix, key in MATERIAL_PREFIXES:
+                if part.startswith(prefix):
+                    item[key] = part[len(prefix):].strip()
+                    break
+        items.append(item)
+    return items
+
+
+def save_act_materials(con, act_id, materials):
+    """Replace all materials of an act. Rows without any value are skipped."""
+    con.execute("DELETE FROM act_materials WHERE act_id = ?", (act_id,))
+    position = 0
+    for item in materials:
+        name = clean(item.get("name"))
+        article = clean(item.get("article"))
+        quantity = clean(item.get("quantity"))
+        if not (name or article or quantity):
+            continue
+        position += 1
+        con.execute(
+            "INSERT INTO act_materials "
+            "(act_id, position, name, article, quantity) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (act_id, position, name, article, quantity),
+        )
+
+
+def get_act_materials(con, act_id):
+    rows = con.execute(
+        "SELECT name, article, quantity FROM act_materials "
+        "WHERE act_id = ? ORDER BY position",
+        (act_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def field(row, *names):
@@ -224,6 +283,62 @@ def init_db():
                 "ALTER TABLE acts "
                 "ADD COLUMN number_type TEXT NOT NULL DEFAULT 'standard'"
             )
+        # Cross-links between a broken act and its repaired copy.
+        if "repaired_by_act_id" not in columns:
+            con.execute(
+                "ALTER TABLE acts ADD COLUMN repaired_by_act_id INTEGER "
+                "REFERENCES acts(id)"
+            )
+        if "repair_of_act_id" not in columns:
+            con.execute(
+                "ALTER TABLE acts ADD COLUMN repair_of_act_id INTEGER "
+                "REFERENCES acts(id)"
+            )
+
+        # Legacy acts were saved without a condition; they are all working.
+        # Thermo acts have no condition at all, so they are left alone.
+        con.execute(
+            "UPDATE acts SET device_condition = ? "
+            "WHERE (device_condition IS NULL OR device_condition = '') "
+            "AND number_type = 'standard'",
+            (CONDITION_WORKING,),
+        )
+        # work_date is required now; legacy acts without it get the date
+        # the act was created.
+        con.execute(
+            "UPDATE acts SET work_date = DATE(created_at) "
+            "WHERE work_date IS NULL OR work_date = ''"
+        )
+
+        has_materials_table = con.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'act_materials'"
+        ).fetchone()
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS act_materials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                act_id INTEGER NOT NULL REFERENCES acts(id),
+                position INTEGER NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                article TEXT NOT NULL DEFAULT '',
+                quantity TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_act_materials_act
+                ON act_materials(act_id);
+            """
+        )
+        # One-time backfill from the old multi-line materials_text column.
+        if not has_materials_table:
+            rows = con.execute(
+                "SELECT id, materials_text FROM acts "
+                "WHERE materials_text IS NOT NULL AND materials_text <> ''"
+            ).fetchall()
+            for row in rows:
+                save_act_materials(
+                    con, row["id"], parse_materials_text(row["materials_text"])
+                )
 
         engineer_columns = {
             row["name"]
@@ -355,17 +470,16 @@ def next_act_number(
     con,
     engineer_code,
     now,
-    status="completed",
+    condition=CONDITION_WORKING,
     number_type="standard",
 ):
     month = now.strftime("%m")
 
-    if status == "draft" and number_type == "thermo":
-        prefix = f"DT-{engineer_code}-{month}-"
-    elif status == "draft":
-        prefix = f"D-{engineer_code}-{month}-"
-    elif number_type == "thermo":
+    # Thermo acts have no condition, so they are always "T-".
+    if number_type == "thermo":
         prefix = f"T-{engineer_code}-{month}-"
+    elif condition == CONDITION_BROKEN:
+        prefix = f"D-{engineer_code}-{month}-"
     else:
         prefix = f"{engineer_code}-{month}-"
 
@@ -1158,7 +1272,7 @@ def save_act():
                     con,
                     engineer["code"],
                     now,
-                    "completed",
+                    values["device_condition"],
                     number_type,
                 )
 
@@ -1214,7 +1328,7 @@ def save_act():
                 con,
                 engineer["code"],
                 now,
-                status,
+                values["device_condition"],
                 number_type,
             )
 
@@ -1610,6 +1724,7 @@ def delete_act_web(act_id):
         if not act:
             flash("Акт не найден.", "danger")
             return redirect(url_for("acts"))
+        con.execute("DELETE FROM act_materials WHERE act_id = ?", (act_id,))
         con.execute("DELETE FROM acts WHERE id = ?", (act_id,))
 
     flash(f"Акт {act['act_number']} удален.", "success")
@@ -1816,54 +1931,310 @@ def api_devices():
     ])
 
 
+ACT_TEXT_FIELDS = [
+    "customer_name",
+    "customer_representative",
+    "device_model",
+    "serial_number",
+    "printeco_label",
+    "device_type",
+    "comment_label",
+    "address",
+    "phone",
+    "fault",
+    "counter_bw",
+    "counter_color",
+    "service_kind",
+    "diagnostics_result",
+    "works_text",
+    "work_date",
+    "start_time",
+    "end_time",
+    "customer_signatory",
+    "intraservice_task_id",
+]
+
+# Free-text fields where the engineer may use several lines.
+ACT_MULTILINE_FIELDS = {"fault", "diagnostics_result", "works_text"}
+
+ACT_REQUIRED_FIELDS = {
+    "customer_name": "Укажите клиента",
+    "serial_number": "Укажите серийный номер",
+    "work_date": "Укажите дату работ",
+}
+
+# A thermo act (ремонт узла терморегистрации) only has a customer, a date
+# and spare parts; every other text field stays empty.
+THERMO_FIELDS = {"customer_name", "work_date"}
+
+ACT_LIST_SQL = """
+    SELECT
+        a.*,
+        repaired.act_number AS repaired_by_act_number,
+        original.act_number AS repair_of_act_number
+    FROM acts a
+    LEFT JOIN acts repaired ON repaired.id = a.repaired_by_act_id
+    LEFT JOIN acts original ON original.id = a.repair_of_act_id
+"""
+
+
+def api_error(message, code, http_status):
+    return jsonify({"error": message, "code": code}), http_status
+
+
+def unauthenticated():
+    return api_error("Не выбран инженер", "UNAUTHENTICATED", 401)
+
+
+def act_state(act):
+    """working / broken / repaired — what the UI shows as the act badge.
+
+    Thermo acts have no condition, so they have no state either.
+    """
+    if act["number_type"] == "thermo":
+        return None
+    if act["repaired_by_act_id"]:
+        return "repaired"
+    if act["device_condition"] == CONDITION_BROKEN:
+        return "broken"
+    return "working"
+
+
+def can_edit_act(act, engineer_key, engineer):
+    if engineer["is_admin"]:
+        return True
+    # A repaired original is a historical record: admins only.
+    if act["repaired_by_act_id"]:
+        return False
+    return act["engineer_key"] == engineer_key
+
+
+def can_repair_act(act):
+    return (
+        act["device_condition"] == CONDITION_BROKEN
+        and not act["repaired_by_act_id"]
+    )
+
+
+def linked_act(act_id, act_number):
+    if not act_id:
+        return None
+    return {"id": act_id, "act_number": act_number or ""}
+
+
+def act_list_item(act):
+    return {
+        "id": act["id"],
+        "act_number": act["act_number"] or "",
+        "number_type": act["number_type"] or "standard",
+        "device_condition": act["device_condition"] or "",
+        "state": act_state(act),
+        "customer_name": act["customer_name"] or "",
+        "device_model": act["device_model"] or "",
+        "serial_number": act["serial_number"] or "",
+        "engineer_name": act["engineer_name"] or "",
+        "engineer_key": act["engineer_key"] or "",
+        "created_at": act["created_at"] or "",
+        "work_date": act["work_date"] or "",
+        "repaired_by": linked_act(
+            act["repaired_by_act_id"], act["repaired_by_act_number"]
+        ),
+        "repair_of": linked_act(
+            act["repair_of_act_id"], act["repair_of_act_number"]
+        ),
+    }
+
+
+def load_act(con, act_id):
+    return con.execute(
+        ACT_LIST_SQL + " WHERE a.id = ?",
+        (act_id,),
+    ).fetchone()
+
+
+def act_detail(con, act, engineer_key, engineer):
+    data = act_list_item(act)
+    data.update({
+        field_name: act[field_name] or "" for field_name in ACT_TEXT_FIELDS
+    })
+    data.update({
+        "engineer_code": act["engineer_code"] or "",
+        "source_device_id": act["source_device_id"],
+        "updated_at": act["updated_at"] or "",
+        "materials": get_act_materials(con, act["id"]),
+        "can_edit": can_edit_act(act, engineer_key, engineer),
+        "can_repair": can_repair_act(act),
+    })
+    return data
+
+
+def format_materials_text(materials):
+    """Keep the legacy materials_text column in sync for xlsx exports."""
+    lines = []
+    for item in materials:
+        if item["name"] or item["article"] or item["quantity"]:
+            lines.append(
+                f"Наименование: {item['name']}; "
+                f"Артикул: {item['article']}; "
+                f"Кол-во: {item['quantity']}"
+            )
+    return "\n".join(lines)
+
+
+def read_act_payload(data, number_type="standard"):
+    """Validate the JSON body of create/update/repair requests.
+
+    Returns (values, materials, error_response). error_response is None when
+    the payload is valid.
+    """
+    if not isinstance(data, dict):
+        return None, None, api_error(
+            "Неверный формат запроса", "BAD_REQUEST", 400
+        )
+
+    thermo = number_type == "thermo"
+    values = {}
+    for name in ACT_TEXT_FIELDS:
+        raw = data.get(name, "")
+        if thermo and name not in THERMO_FIELDS:
+            raw = ""
+        if not isinstance(raw, str):
+            raw = "" if raw is None else str(raw)
+        values[name] = (
+            clean_multiline(raw)
+            if name in ACT_MULTILINE_FIELDS
+            else clean(raw)
+        )
+
+    for name, message in ACT_REQUIRED_FIELDS.items():
+        if thermo and name not in THERMO_FIELDS:
+            continue
+        if not values[name]:
+            return None, None, api_error(message, "VALIDATION_ERROR", 400)
+
+    try:
+        datetime.strptime(values["work_date"], "%Y-%m-%d")
+    except ValueError:
+        return None, None, api_error(
+            "Неверный формат даты работ", "VALIDATION_ERROR", 400
+        )
+
+    raw_materials = data.get("materials", [])
+    if not isinstance(raw_materials, list) or not all(
+        isinstance(item, dict) for item in raw_materials
+    ):
+        return None, None, api_error(
+            "Неверный формат материалов", "VALIDATION_ERROR", 400
+        )
+
+    materials = []
+    for item in raw_materials:
+        material = {
+            key: clean(str(item.get(key) or ""))
+            for key in ("name", "article", "quantity")
+        }
+        if material["name"] or material["article"] or material["quantity"]:
+            materials.append(material)
+
+    return values, materials, None
+
+
+def resolve_source_device(con, data, values, now):
+    """Use the device picked from the catalogue, or remember a manual one."""
+    device_id = data.get("source_device_id")
+    if isinstance(device_id, int):
+        exists = con.execute(
+            "SELECT 1 FROM devices WHERE id = ?",
+            (device_id,),
+        ).fetchone()
+        if exists:
+            return device_id
+    return save_manual_device(con, values, now)
+
+
+def insert_act(
+    con,
+    engineer_key,
+    engineer,
+    values,
+    materials,
+    condition,
+    number_type,
+    source_device_id,
+    now,
+    repair_of_act_id=None,
+):
+    number = next_act_number(
+        con, engineer["code"], now, condition, number_type
+    )
+    timestamp = now.isoformat(timespec="seconds")
+    columns = [
+        "act_number", "number_type", "engineer_key", "engineer_name",
+        "engineer_code", "created_at", "updated_at", "status",
+        "device_condition", "materials_text", "source_device_id",
+        "repair_of_act_id",
+    ] + ACT_TEXT_FIELDS
+    row = [
+        number, number_type, engineer_key, engineer["name"],
+        engineer["code"], timestamp, timestamp, "completed",
+        condition, format_materials_text(materials), source_device_id,
+        repair_of_act_id,
+    ] + [values[name] for name in ACT_TEXT_FIELDS]
+
+    cursor = con.execute(
+        f"INSERT INTO acts ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        row,
+    )
+    save_act_materials(con, cursor.lastrowid, materials)
+    return cursor.lastrowid
+
+
 @app.route("/api/acts", methods=["GET"])
 def api_acts_list():
     if not get_engineer():
-        return jsonify({
-            "error": "Не выбран инженер",
-            "code": "UNAUTHENTICATED",
-        }), 401
+        return unauthenticated()
 
-    q = clean(request.args.get("q", ""))
-    engineer_filter = clean(request.args.get("engineer", ""))
-    status_filter = clean(request.args.get("status", ""))
+    number_type = clean(request.args.get("type", "")) or "standard"
+    if number_type not in NUMBER_TYPES:
+        number_type = "standard"
+    thermo = number_type == "thermo"
+
+    # The thermo list only has customer and date filters.
+    q = "" if thermo else clean(request.args.get("q", ""))
+    customer = clean(request.args.get("customer", "")) if thermo else ""
+    engineer_filter = (
+        "" if thermo else clean(request.args.get("engineer", ""))
+    )
+    state_filter = "" if thermo else clean(request.args.get("state", ""))
     date_from = clean(request.args.get("date_from", ""))
     date_to = clean(request.args.get("date_to", ""))
 
-    sql = """
-        SELECT
-            id,
-            act_number,
-            status,
-            customer_name,
-            device_model,
-            serial_number,
-            engineer_name,
-            engineer_key,
-            created_at,
-            work_date
-        FROM acts
-        WHERE 1=1
-    """
-    params = []
+    sql = ACT_LIST_SQL + " WHERE a.number_type = ?"
+    params = [number_type]
 
     if engineer_filter in get_engineers_dict():
-        sql += " AND engineer_key = ?"
+        sql += " AND a.engineer_key = ?"
         params.append(engineer_filter)
 
-    if status_filter in {"draft", "completed"}:
-        sql += " AND status = ?"
-        params.append(status_filter)
+    # "broken" includes repaired originals: their condition stays broken,
+    # only the badge in the list says "repaired".
+    if state_filter == "working":
+        sql += " AND a.device_condition = ?"
+        params.append(CONDITION_WORKING)
+    elif state_filter == "broken":
+        sql += " AND a.device_condition = ?"
+        params.append(CONDITION_BROKEN)
 
     if date_from:
-        sql += " AND DATE(created_at) >= DATE(?)"
+        sql += " AND DATE(a.created_at) >= DATE(?)"
         params.append(date_from)
 
     if date_to:
-        sql += " AND DATE(created_at) <= DATE(?)"
+        sql += " AND DATE(a.created_at) <= DATE(?)"
         params.append(date_to)
 
-    sql += " ORDER BY datetime(created_at) DESC, id DESC"
+    sql += " ORDER BY datetime(a.created_at) DESC, a.id DESC"
 
     with db() as con:
         rows = con.execute(sql, params).fetchall()
@@ -1883,79 +2254,228 @@ def api_acts_list():
             )
         ]
 
+    if customer:
+        customer_norm = customer.lower()
+        rows = [
+            row
+            for row in rows
+            if customer_norm in (row["customer_name"] or "").lower()
+        ]
+
     rows = rows[:200]
 
-    return jsonify([
-        {
-            "id": row["id"],
-            "act_number": row["act_number"] or "",
-            "status": row["status"],
-            "customer_name": row["customer_name"] or "",
-            "device_model": row["device_model"] or "",
-            "serial_number": row["serial_number"] or "",
-            "engineer_name": row["engineer_name"] or "",
-            "engineer_key": row["engineer_key"] or "",
-            "created_at": row["created_at"] or "",
-            "work_date": row["work_date"] or "",
-        }
-        for row in rows
-    ])
+    return jsonify([act_list_item(row) for row in rows])
 
 
 @app.route("/api/acts/<int:act_id>", methods=["GET"])
 def api_act_detail(act_id):
-    if not get_engineer():
-        return jsonify({
-            "error": "Не выбран инженер",
-            "code": "UNAUTHENTICATED",
-        }), 401
+    engineer = get_engineer()
+    if not engineer:
+        return unauthenticated()
 
     with db() as con:
-        act = con.execute(
-            "SELECT * FROM acts WHERE id = ?",
-            (act_id,),
+        act = load_act(con, act_id)
+        if not act:
+            return api_error("Акт не найден", "NOT_FOUND", 404)
+        return jsonify(
+            act_detail(con, act, session["engineer_key"], engineer)
+        )
+
+
+@app.route("/api/acts", methods=["POST"])
+def api_act_create():
+    engineer = get_engineer()
+    if not engineer:
+        return unauthenticated()
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("Неверный формат запроса", "BAD_REQUEST", 400)
+
+    number_type = data.get("number_type") or "standard"
+    if number_type not in NUMBER_TYPES:
+        return api_error("Неверный тип акта", "VALIDATION_ERROR", 400)
+
+    values, materials, error = read_act_payload(data, number_type)
+    if error:
+        return error
+
+    if number_type == "thermo":
+        condition = ""
+    else:
+        condition = clean(data.get("device_condition"))
+        if condition not in DEVICE_CONDITIONS:
+            return api_error(
+                "Укажите состояние аппарата", "VALIDATION_ERROR", 400
+            )
+
+    engineer_key = session["engineer_key"]
+    now = datetime.now()
+
+    with db() as con:
+        source_device_id = (
+            None if number_type == "thermo"
+            else resolve_source_device(con, data, values, now)
+        )
+        act_id = insert_act(
+            con, engineer_key, engineer, values, materials,
+            condition, number_type, source_device_id, now,
+        )
+        act = load_act(con, act_id)
+        return jsonify(act_detail(con, act, engineer_key, engineer)), 201
+
+
+@app.route("/api/acts/<int:act_id>", methods=["PUT"])
+def api_act_update(act_id):
+    engineer = get_engineer()
+    if not engineer:
+        return unauthenticated()
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("Неверный формат запроса", "BAD_REQUEST", 400)
+
+    engineer_key = session["engineer_key"]
+    now = datetime.now()
+
+    with db() as con:
+        act = load_act(con, act_id)
+        if not act:
+            return api_error("Акт не найден", "NOT_FOUND", 404)
+
+        if not can_edit_act(act, engineer_key, engineer):
+            return api_error(
+                "Нет прав на редактирование этого акта", "FORBIDDEN", 403
+            )
+
+        thermo = act["number_type"] == "thermo"
+        values, materials, error = read_act_payload(data, act["number_type"])
+        if error:
+            return error
+
+        # Condition and number type define the act number: frozen forever.
+        condition = data.get("device_condition")
+        if (
+            not thermo
+            and condition is not None
+            and clean(condition) != act["device_condition"]
+        ):
+            return api_error(
+                "Состояние аппарата нельзя изменить после сохранения",
+                "CONDITION_FROZEN",
+                400,
+            )
+        number_type = data.get("number_type")
+        if number_type is not None and number_type != act["number_type"]:
+            return api_error(
+                "Тип акта нельзя изменить после сохранения",
+                "NUMBER_TYPE_FROZEN",
+                400,
+            )
+
+        source_device_id = (
+            None if thermo
+            else resolve_source_device(con, data, values, now)
+        )
+        assignments =", ".join(f"{name} = ?" for name in ACT_TEXT_FIELDS)
+        con.execute(
+            f"UPDATE acts SET {assignments}, materials_text = ?, "
+            "source_device_id = ?, updated_at = ? WHERE id = ?",
+            [values[name] for name in ACT_TEXT_FIELDS] + [
+                format_materials_text(materials),
+                source_device_id,
+                now.isoformat(timespec="seconds"),
+                act_id,
+            ],
+        )
+        save_act_materials(con, act_id, materials)
+
+        act = load_act(con, act_id)
+        return jsonify(act_detail(con, act, engineer_key, engineer))
+
+
+@app.route("/api/acts/<int:act_id>/repair", methods=["POST"])
+def api_act_repair(act_id):
+    """Mark a broken act as repaired by creating a working copy of it."""
+    engineer = get_engineer()
+    if not engineer:
+        return unauthenticated()
+
+    data = request.get_json(silent=True)
+    values, materials, error = read_act_payload(data)
+    if error:
+        return error
+
+    engineer_key = session["engineer_key"]
+    now = datetime.now()
+
+    with db() as con:
+        original = load_act(con, act_id)
+        if not original:
+            return api_error("Акт не найден", "NOT_FOUND", 404)
+
+        if original["device_condition"] != CONDITION_BROKEN:
+            return api_error(
+                "Отремонтировать можно только акт «Не работает»",
+                "NOT_BROKEN",
+                400,
+            )
+        if original["repaired_by_act_id"]:
+            return api_error(
+                "Этот акт уже отремонтирован",
+                "ALREADY_REPAIRED",
+                409,
+            )
+
+        source_device_id = resolve_source_device(con, data, values, now)
+        copy_id = insert_act(
+            con, engineer_key, engineer, values, materials,
+            CONDITION_WORKING, original["number_type"] or "standard",
+            source_device_id, now, repair_of_act_id=act_id,
+        )
+        con.execute(
+            "UPDATE acts SET repaired_by_act_id = ?, updated_at = ? "
+            "WHERE id = ?",
+            (copy_id, now.isoformat(timespec="seconds"), act_id),
+        )
+
+        copy = load_act(con, copy_id)
+        return jsonify(act_detail(con, copy, engineer_key, engineer)), 201
+
+
+@app.route("/api/acts/stats", methods=["GET"])
+def api_acts_stats():
+    """Counters for the home page: all time and the current calendar month.
+
+    The month is taken from work_date. "broken" includes repaired originals,
+    the same way the list filter does.
+    """
+    if not get_engineer():
+        return unauthenticated()
+
+    month_prefix = datetime.now().strftime("%Y-%m-") + "%"
+    sql = """
+        SELECT
+            SUM(number_type = 'standard' AND device_condition = ?) AS working,
+            SUM(number_type = 'standard' AND device_condition = ?) AS broken,
+            SUM(number_type = 'thermo') AS thermo
+        FROM acts
+    """
+
+    with db() as con:
+        total = con.execute(
+            sql, (CONDITION_WORKING, CONDITION_BROKEN)
+        ).fetchone()
+        month = con.execute(
+            sql + " WHERE work_date LIKE ?",
+            (CONDITION_WORKING, CONDITION_BROKEN, month_prefix),
         ).fetchone()
 
-    if not act:
-        return jsonify({
-            "error": "Акт не найден",
-            "code": "NOT_FOUND",
-        }), 404
+    def counters(row):
+        return {key: row[key] or 0 for key in ("working", "broken", "thermo")}
 
-    return jsonify({
-        "id": act["id"],
-        "act_number": act["act_number"] or "",
-        "number_type": act["number_type"] or "standard",
-        "status": act["status"] or "",
-        "engineer_key": act["engineer_key"] or "",
-        "engineer_name": act["engineer_name"] or "",
-        "engineer_code": act["engineer_code"] or "",
-        "customer_name": act["customer_name"] or "",
-        "customer_representative": act["customer_representative"] or "",
-        "device_model": act["device_model"] or "",
-        "serial_number": act["serial_number"] or "",
-        "printeco_label": act["printeco_label"] or "",
-        "device_type": act["device_type"] or "",
-        "comment_label": act["comment_label"] or "",
-        "address": act["address"] or "",
-        "phone": act["phone"] or "",
-        "fault": act["fault"] or "",
-        "counter_bw": act["counter_bw"] or "",
-        "counter_color": act["counter_color"] or "",
-        "service_kind": act["service_kind"] or "",
-        "diagnostics_result": act["diagnostics_result"] or "",
-        "works_text": act["works_text"] or "",
-        "materials_text": act["materials_text"] or "",
-        "work_date": act["work_date"] or "",
-        "start_time": act["start_time"] or "",
-        "end_time": act["end_time"] or "",
-        "device_condition": act["device_condition"] or "",
-        "customer_signatory": act["customer_signatory"] or "",
-        "source_device_id": act["source_device_id"],
-        "intraservice_task_id": act["intraservice_task_id"] or "",
-        "created_at": act["created_at"] or "",
-        "updated_at": act["updated_at"] or "",
-    })
+    return jsonify({"total": counters(total), "month": counters(month)})
+
 
 if __name__ == "__main__":
     init_db()
